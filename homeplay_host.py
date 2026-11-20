@@ -33,6 +33,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -47,7 +48,7 @@ import urllib.parse
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 IS_WINDOWS = sys.platform == "win32"
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
@@ -56,9 +57,10 @@ CERT_DIR = BASE_DIR / "certs"
 DEMO_SIZE = (1280, 720)
 
 # Binary messages from host to browser. The first byte is the message type.
-MSG_VIDEO_CONFIG = 1  # [1][AVCDecoderConfigurationRecord]
-MSG_VIDEO_FRAME = 2   # [2][flags u8][seq u32le][timestamp ms u32le][H.264 access unit, length-prefixed NALs]
-MSG_AUDIO = 3         # [3][channels u8][0 u16][sample rate u32le][PCM s16le interleaved]
+MSG_VIDEO_CONFIG = 1  # [1][codec string length u8][codec string][decoder config record]
+MSG_VIDEO_FRAME = 2   # [2][flags u8][seq u32le][timestamp ms u32le][access unit, length-prefixed NALs / OBUs]
+MSG_AUDIO = 3         # [3][channels u8][block seq u16le][sample rate u32le][PCM s16le interleaved]
+MSG_AUDIO_OPUS = 4    # [4][channels u8][packet seq u16le][sample rate u32le][one 10 ms Opus packet]
 
 # WebSocket close codes the page understands.
 CLOSE_BAD_PASSWORD = 4001
@@ -212,6 +214,79 @@ class Windows:
                 k32.SetConsoleMode(handle, (mode.value & ~0x0040) | 0x0080)
         except Exception:
             pass
+        Windows.boost_process()
+
+    # ---- staying fast while a game is using the PC ----
+    @staticmethod
+    def _kernel32():
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k32.SetPriorityClass.restype = wintypes.BOOL
+        k32.SetProcessInformation.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+        k32.SetProcessInformation.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        return k32
+
+    @staticmethod
+    def boost_process(pid: int | None = None) -> bool:
+        """Keep a process responsive while a game has the focus: opt it out of Windows power
+        throttling (EcoQoS), which slows down background work, and give this process
+        above-normal priority (FFmpeg gets that at launch). pid=None means this process."""
+        if not IS_WINDOWS:
+            return False
+        try:
+            k32 = Windows._kernel32()
+
+            class POWER_THROTTLING_STATE(ctypes.Structure):
+                _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG),
+                            ("StateMask", wintypes.ULONG)]
+
+            # Version 1, control EXECUTION_SPEED, state 0 = "never throttle me"
+            state = POWER_THROTTLING_STATE(1, 0x1, 0x0)
+            if pid is None:
+                handle, close = k32.GetCurrentProcess(), False
+                k32.SetPriorityClass(handle, 0x00008000)            # ABOVE_NORMAL_PRIORITY_CLASS
+            else:
+                handle, close = k32.OpenProcess(0x0200, False, pid), True   # PROCESS_SET_INFORMATION
+                if not handle:
+                    return False
+            try:
+                return bool(k32.SetProcessInformation(handle, 4,        # ProcessPowerThrottling
+                                                      ctypes.byref(state), ctypes.sizeof(state)))
+            finally:
+                if close:
+                    k32.CloseHandle(handle)
+        except Exception as e:
+            log.debug("Could not tune process %s: %s", pid or "self", e)
+            return False
+
+    @staticmethod
+    def mmcss_begin(task: str = "Audio"):
+        """Put the calling thread in the Multimedia Class Scheduler, so sound keeps flowing
+        when a game loads the CPU. Returns a handle for mmcss_end(), or None."""
+        if not IS_WINDOWS:
+            return None
+        try:
+            avrt = ctypes.WinDLL("avrt")
+            avrt.AvSetMmThreadCharacteristicsW.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD))
+            avrt.AvSetMmThreadCharacteristicsW.restype = wintypes.HANDLE
+            index = wintypes.DWORD(0)
+            return avrt.AvSetMmThreadCharacteristicsW(task, ctypes.byref(index)) or None
+        except Exception as e:
+            log.debug("MMCSS not available: %s", e)
+            return None
+
+    @staticmethod
+    def mmcss_end(handle) -> None:
+        if not handle or not IS_WINDOWS:
+            return
+        with contextlib.suppress(Exception):
+            avrt = ctypes.WinDLL("avrt")
+            avrt.AvRevertMmThreadCharacteristics.argtypes = (wintypes.HANDLE,)
+            avrt.AvRevertMmThreadCharacteristics(handle)
 
     @staticmethod
     def _execution_state(flags: int) -> None:
@@ -776,25 +851,31 @@ class AudioCapture:
     def _alive(self, generation: int) -> bool:
         return generation == self._generation
 
-    def _emit(self, pcm: bytes, rate: int, channels: int) -> None:
+    def _emit(self, pcm: bytes, rate: int, channels: int, silent: bool = False) -> None:
+        """Hand one 10 ms block to the event loop. Every block is reported, silent ones too,
+        so the receiver can tell 'the PC went quiet' from 'the network was late'."""
         with contextlib.suppress(RuntimeError):
-            self.loop.call_soon_threadsafe(self.on_pcm, pcm, rate, channels)
+            self.loop.call_soon_threadsafe(self.on_pcm, pcm, rate, channels, silent)
 
     def _run(self, generation: int) -> None:
         if self.demo:
             self._run_demo(generation)
             return
-        errors = []
-        for runner in (self._run_soundcard, self._run_pyaudiowpatch):
-            try:
-                runner(generation)
-                return
-            except ImportError as e:
-                errors.append(str(e))
-            except Exception as e:
-                errors.append(f"{type(e).__name__}: {e}")
-                log.debug("Audio backend failed", exc_info=True)
-        log.warning("No sound: could not capture audio (%s).", "; ".join(errors))
+        mmcss = Windows.mmcss_begin("Audio")         # keep capturing smoothly under game load
+        try:
+            errors = []
+            for runner in (self._run_soundcard, self._run_pyaudiowpatch):
+                try:
+                    runner(generation)
+                    return
+                except ImportError as e:
+                    errors.append(str(e))
+                except Exception as e:
+                    errors.append(f"{type(e).__name__}: {e}")
+                    log.debug("Audio backend failed", exc_info=True)
+            log.warning("No sound: could not capture audio (%s).", "; ".join(errors))
+        finally:
+            Windows.mmcss_end(mmcss)
 
     def _run_soundcard(self, generation: int) -> None:
         import warnings
@@ -814,9 +895,8 @@ class AudioCapture:
                     if data.ndim == 1:
                         data = data[:, None]
                     stereo = downmix_to_stereo(data, np)
-                    if np.any(stereo):                        # silence is not sent at all
-                        pcm = (np.clip(stereo, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
-                        self._emit(pcm, self.RATE, 2)
+                    pcm = (np.clip(stereo, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+                    self._emit(pcm, self.RATE, 2, silent=not np.any(stereo))
                     now = time.monotonic()
                     if now - last_check > 3:                  # follow changes of the default output
                         last_check = now
@@ -848,8 +928,8 @@ class AudioCapture:
                     raw = stream.read(frames, exception_on_overflow=False)
                     data = np.frombuffer(raw, dtype="<i2").reshape(-1, channels).astype(np.float32) / 32768.0
                     stereo = downmix_to_stereo(data, np)
-                    if np.any(stereo):
-                        self._emit((np.clip(stereo, -1, 1) * 32767).astype("<i2").tobytes(), rate, 2)
+                    self._emit((np.clip(stereo, -1, 1) * 32767).astype("<i2").tobytes(), rate, 2,
+                               silent=not np.any(stereo))
             finally:
                 stream.close()
         finally:
@@ -859,19 +939,156 @@ class AudioCapture:
         """A short 440 Hz beep every second, paced in real time."""
         rate, block = self.RATE, self.BLOCK
         start, sent = time.monotonic(), 0
+        silence = bytes(block * 4)
         while self._alive(generation):
             t0 = sent / rate
             if (t0 % 1.0) < 0.15:
                 samples = [int(6000 * math.sin(2 * math.pi * 440 * (sent + i) / rate)) for i in range(block)]
                 self._emit(struct.pack(f"<{block * 2}h", *(v for s in samples for v in (s, s))), rate, 2)
+            else:
+                self._emit(silence, rate, 2, silent=True)
             sent += block
             delay = start + sent / rate - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
 
 
+def wav_stream_header(rate: int, channels: int) -> bytes:
+    """A WAV header for an endless 16-bit PCM stream (sizes set to 'unknown')."""
+    return (b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE" +
+            b"fmt " + struct.pack("<IHHIIHH", 16, 1, channels, rate, rate * channels * 2, channels * 2, 16) +
+            b"data" + struct.pack("<I", 0xFFFFFFFF))
+
+
+def rtp_payload(data: bytes):
+    """The payload of an RTP packet, or None for RTCP or anything malformed."""
+    if len(data) < 12 or data[0] >> 6 != 2 or (data[1] & 0x7F) < 96:   # not RTP v2 / dynamic type
+        return None
+    start = 12 + 4 * (data[0] & 0x0F)                     # fixed header + CSRC list
+    if data[0] & 0x10:                                    # header extension
+        if len(data) < start + 4:
+            return None
+        start += 4 + 4 * struct.unpack(">H", data[start + 2:start + 4])[0]
+    end = len(data) - (data[-1] if data[0] & 0x20 else 0)  # padding
+    return bytes(data[start:end]) if end > start else None
+
+
+class OpusEncoder:
+    """Compresses the PC's sound (48 kHz stereo PCM) to Opus with FFmpeg's libopus in
+    low-delay mode: ~0.15 instead of ~1.5 Mbit/s, for about 10 ms of extra delay.
+    PCM goes in through a pipe; packets come back as RTP on a loopback-only UDP socket,
+    which hands over each packet the moment it's encoded (an Ogg pipe would hold one back)."""
+
+    RATE, CHANNELS, BLOCK = 48000, 2, 480                   # 10 ms frames
+
+    def __init__(self, ffmpeg_path: str, loop, on_packet, on_failed, kbps: int = 128):
+        self.ffmpeg_path = ffmpeg_path
+        self.loop = loop
+        self.on_packet = on_packet
+        self.on_failed = on_failed
+        self.kbps = kbps
+        self.proc = None
+        self.sock = None
+        self.queue: queue.Queue = queue.Queue(maxsize=50)   # ~0.5 s of sound
+        self.running = False
+        self.fed = 0
+        self.packets = 0
+        self.tail = collections.deque(maxlen=5)
+
+    def command(self, port: int) -> list[str]:
+        return [self.ffmpeg_path, "-hide_banner", "-nostats", "-loglevel", "error",
+                "-fflags", "nobuffer", "-probesize", "32", "-analyzeduration", "0",
+                "-f", "wav", "-max_size", str(self.BLOCK * self.CHANNELS * 2), "-ignore_length", "1",
+                "-i", "pipe:0",
+                "-c:a", "libopus", "-application", "lowdelay", "-frame_duration", "10", "-b:a", f"{self.kbps}k",
+                # localaddr keeps FFmpeg's own sockets on loopback (no firewall prompt)
+                "-f", "rtp", f"rtp://127.0.0.1:{port}?rtcpport={port}&localaddr=127.0.0.1&pkt_size=1400"]
+
+    def start(self) -> bool:
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.bind(("127.0.0.1", 0))
+            self.sock.settimeout(0.5)
+            self.proc = subprocess.Popen(self.command(self.sock.getsockname()[1]), stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0,
+                                         creationflags=NO_WINDOW | ABOVE_NORMAL)
+            self.proc.stdin.write(wav_stream_header(self.RATE, self.CHANNELS))
+        except (OSError, ValueError) as e:
+            log.debug("Opus encoder could not start: %s", e)
+            self.stop()
+            return False
+        Windows.boost_process(self.proc.pid)
+        self.running = True
+        for target, name in ((self._writer, "opus-in"), (self._reader, "opus-out"), (self._drain, "opus-log")):
+            threading.Thread(target=target, name=name, daemon=True).start()
+        return True
+
+    def feed(self, pcm: bytes) -> None:
+        """Queue 10 ms of 48 kHz stereo s16 PCM. Never blocks; drops if the encoder falls behind."""
+        if self.running:
+            with contextlib.suppress(queue.Full):
+                self.queue.put_nowait(pcm)
+                self.fed += 1
+
+    def _writer(self) -> None:
+        try:
+            while self.running:
+                pcm = self.queue.get()
+                if pcm is None:
+                    return
+                self.proc.stdin.write(pcm)
+        except (OSError, ValueError):
+            self._fail("the encoder stopped taking sound")
+
+    def _reader(self) -> None:
+        while self.running:
+            try:
+                data = self.sock.recv(2048)
+            except socket.timeout:
+                if self.proc.poll() is not None:
+                    self._fail(self.tail[-1] if self.tail else f"FFmpeg exited ({self.proc.returncode})")
+                elif self.fed > 300 and self.packets == 0:       # 3 s of sound in, nothing out
+                    self._fail("no output")
+                continue
+            except OSError:
+                return
+            packet = rtp_payload(data)
+            if packet:
+                self.packets += 1
+                with contextlib.suppress(RuntimeError):          # event loop already closed
+                    self.loop.call_soon_threadsafe(self.on_packet, packet)
+
+    def _drain(self) -> None:
+        with contextlib.suppress(Exception):
+            for line in self.proc.stderr:
+                text = line.decode("utf-8", "replace").strip()
+                if text:
+                    self.tail.append(text)
+
+    def _fail(self, reason: str) -> None:
+        if self.running:
+            self.running = False
+            with contextlib.suppress(RuntimeError):
+                self.loop.call_soon_threadsafe(self.on_failed, reason)
+
+    def stop(self) -> None:
+        self.running = False
+        with contextlib.suppress(Exception):
+            self.queue.put_nowait(None)
+        if self.proc:
+            with contextlib.suppress(Exception):
+                self.proc.stdin.close()
+            with contextlib.suppress(Exception):
+                self.proc.kill()
+            with contextlib.suppress(Exception):
+                self.proc.wait(timeout=2)
+        if self.sock:
+            with contextlib.suppress(Exception):
+                self.sock.close()
+
+
 # ======================================================================================
-# Video: FFmpeg screen capture + H.264 encoding, read back as FLV
+# Video: FFmpeg screen capture + H.264 / HEVC / AV1 encoding, read back as FLV
 # ======================================================================================
 
 # Encoder "families" are the hardware/software back-ends; each can encode one or more codecs.
@@ -990,12 +1207,23 @@ def filter_variants(enc: str, hw_source: bool, target, filters: set[str]):
     return variants
 
 
-def codec_args(family: str, codec: str, profile: str, kbps: int, gop: int) -> list[str]:
+VBV_SECONDS = 0.05      # ~3 frames at 60 fps
+
+
+def vbv_kbits(kbps: int, fps: int) -> int:
+    """Rate-control (VBV) buffer size. No frame can be bigger than this buffer, so it bounds how
+    long one frame takes to send when the link is only about as fast as the bitrate. Keyframes
+    are the big ones: with a 1/8 s buffer they could stall the picture for ~125 ms every couple
+    of seconds; with ~50 ms they can't, at the cost of a slightly softer keyframe."""
+    seconds = max(VBV_SECONDS, 3.0 / max(1, fps))          # never less than ~3 frames
+    return max(100, round(kbps * seconds))
+
+
+def codec_args(family: str, codec: str, profile: str, kbps: int, gop: int, fps: int = 60) -> list[str]:
     rate = f"{kbps}k"
     enc = ffmpeg_encoder(family, codec)
-    # Small VBV buffer (~1/8 s): steadier frame sizes, so no big latency spikes on keyframes.
     # -bf 0: no B-frames, so there is no frame reordering and the browser shows each frame at once.
-    common = ["-b:v", rate, "-maxrate", rate, "-bufsize", f"{max(250, kbps // 8)}k",
+    common = ["-b:v", rate, "-maxrate", rate, "-bufsize", f"{vbv_kbits(kbps, fps)}k",
               "-g", str(gop), "-bf", "0"]
     if family == "nvenc":
         args = ["-c:v", enc, "-preset", "p2", "-tune", "ull", "-rc", "cbr", "-zerolatency", "1",
@@ -1200,7 +1428,7 @@ class VideoPipeline:
             cmd += ["-f", "gdigrab", "-framerate", str(s.fps), "-draw_mouse", str(int(s.cursor)), "-i", "desktop"]
         if vf:
             cmd += ["-vf", vf]
-        cmd += codec_args(family, codec, profile, s.kbps, gop)
+        cmd += codec_args(family, codec, profile, s.kbps, gop, s.fps)
         cmd += self.ff.fps_mode_args
         cmd += ["-an", "-sn", "-dn", "-f", "flv", "-flvflags", "no_duration_filesize",
                 "-flush_packets", "1", "pipe:1"]
@@ -1271,6 +1499,7 @@ class VideoPipeline:
         except OSError as e:
             self.last_error = f"could not run FFmpeg: {e}"
             return None
+        Windows.boost_process(proc.pid)                   # don't let Windows throttle the encoder
         tail = collections.deque(maxlen=12)
         err_task = asyncio.create_task(self._drain(proc.stderr, tail))
         first_keyframe = asyncio.get_running_loop().create_future()
@@ -1382,9 +1611,10 @@ class WebSocket:
             header = struct.pack("!BBH", 0x80 | opcode, 126, n)
         else:
             header = struct.pack("!BBQ", 0x80 | opcode, 127, n)
-        self.writer.write(header)                 # all writes of one frame happen without awaiting,
-        for part in parts:                        # so frames from different tasks never interleave
-            self.writer.write(part)
+        # One writelines() call per frame: header and payload leave together (a single
+        # scatter-gather send where the transport supports it) instead of a tiny header
+        # packet first; and frames from different tasks can never interleave.
+        self.writer.writelines([header, *parts])
         await self.writer.drain()
 
     async def recv(self):
@@ -1572,6 +1802,11 @@ class Session:
                     caps.add(c)
         self.codec_caps = caps
         self.auto = AutoBitrate(self.settings)
+        # Sound: Opus if the browser can decode it (and the user didn't ask for raw), else PCM.
+        audio_caps = hello.get("audio") if isinstance(hello.get("audio"), dict) else {}
+        self.can_opus = bool(audio_caps.get("opus"))
+        self.audio_codec = "opus" if (self.can_opus and not audio_caps.get("raw") and app.opus_ok) else "pcm"
+        self.opus_seq = 0
 
     # ---- outgoing -------------------------------------------------------------------
     def send_json(self, obj) -> None:
@@ -1656,9 +1891,15 @@ class Session:
             self.rtt_now = min(self.rtt_now, rtt)
         self.min_rtt = min(self.rtt_now, self.rtt_before)
 
-    def on_audio(self, pcm: bytes, rate: int, channels: int) -> None:
+    def on_audio(self, pcm: bytes, rate: int, channels: int, seq: int = 0) -> None:
         if self.alive and self.out.qsize() < 40:
-            self.send_binary(struct.pack("<BBHI", MSG_AUDIO, channels, 0, rate), pcm)
+            self.send_binary(struct.pack("<BBHI", MSG_AUDIO, channels, seq & 0xFFFF, rate), pcm)
+
+    def on_opus(self, packet: bytes) -> None:
+        self.opus_seq = (self.opus_seq + 1) & 0xFFFF
+        if self.alive and self.out.qsize() < 40:
+            self.send_binary(struct.pack("<BBHI", MSG_AUDIO_OPUS, OpusEncoder.CHANNELS, self.opus_seq,
+                                         OpusEncoder.RATE), packet)
 
     # ---- incoming -------------------------------------------------------------------
     def handle(self, m) -> None:
@@ -1712,6 +1953,10 @@ class Session:
             elif t == "clip":                     # browser sends text to put on the PC clipboard
                 if isinstance(m[1], str):
                     self.app.set_clipboard(m[1][:100000])
+            elif t == "audio":                    # browser picks the sound format: "opus" or "pcm"
+                if len(m) > 2 and m[2] == "failed":
+                    self.can_opus = False         # it couldn't decode Opus after all: don't try again
+                self.app.set_audio_codec(self, "opus" if m[1] == "opus" else "pcm")
         except (IndexError, TypeError, ValueError, OverflowError) as e:
             log.debug("Ignored bad message %r: %s", m, e)
         except Exception as e:                    # a failing input device must not end the session
@@ -1806,6 +2051,9 @@ class HostApp:
         forced_family = None if args.encoder == "auto" else args.encoder
         forced_codec = None if args.codec == "auto" else args.codec
         self.codec_caps: set[str] = {"h264"}      # which codecs the connected browser can decode
+        self.opus_ok = "libopus" in ff.encoders and not args.no_audio   # can we compress sound?
+        self.opus: OpusEncoder | None = None
+        self.audio_seq = 0
         self.video = VideoPipeline(self, ff, args.demo, args.gop, forced_family, forced_codec)
         self.session: Session | None = None
         self.session_lock = asyncio.Lock()
@@ -1831,9 +2079,56 @@ class HostApp:
         if self.session:
             self.session.send_json({"t": "status", "msg": message})
 
-    def _on_audio(self, pcm, rate, channels):
+    def _on_audio(self, pcm, rate, channels, silent=False):
+        self.audio_seq = (self.audio_seq + 1) & 0xFFFF     # counts every 10 ms block, silent or not
+        s = self.session
+        if not s:
+            return
+        if (s.audio_codec == "opus" and self.opus and self.opus.running
+                and rate == OpusEncoder.RATE and channels == OpusEncoder.CHANNELS):
+            # Silence goes in too: Opus shrinks it to ~20 bytes and the stream stays
+            # continuous, so the browser can tell network jitter from a quiet game.
+            self.opus.feed(pcm)                    # packets come back through _on_opus
+        elif not silent:                           # raw sound: silence isn't sent; the block
+            s.on_audio(pcm, rate, channels, self.audio_seq)   # counter shows the gap instead
+
+    # ---- Opus sound ------------------------------------------------------------------
+    def _on_opus(self, packet: bytes) -> None:
+        if self.session and self.session.audio_codec == "opus":
+            self.session.on_opus(packet)
+
+    def _on_opus_failed(self, reason: str) -> None:
+        log.warning("Sound compression stopped (%s); sending uncompressed sound instead.", reason)
+        self._stop_opus()
+        self.opus_ok = False
         if self.session:
-            self.session.on_audio(pcm, rate, channels)
+            self.session.audio_codec = "pcm"
+
+    def _start_opus(self) -> None:
+        if self.opus or not self.opus_ok:
+            return
+        encoder = OpusEncoder(self.ff.path, self.loop, self._on_opus, self._on_opus_failed)
+        if encoder.start():
+            self.opus = encoder
+            log.info("Sound: Opus, %d kbit/s", encoder.kbps)
+        else:
+            self.opus_ok = False
+            log.warning("Sound compression isn't available; sending uncompressed sound.")
+
+    def _stop_opus(self) -> None:
+        encoder, self.opus = self.opus, None
+        if encoder:
+            encoder.stop()
+
+    def set_audio_codec(self, session, codec: str) -> None:
+        """Switch a session between Opus and raw PCM sound (on request, or after a failure)."""
+        want = codec == "opus" and session.can_opus and self.opus_ok
+        session.audio_codec = "opus" if want else "pcm"
+        if session is self.session:
+            if want and self.audio:
+                self._start_opus()
+            elif not want:
+                self._stop_opus()
 
     def _on_rumble(self, pad_id, large, small):
         if self.session:
@@ -1888,7 +2183,7 @@ class HostApp:
         monitors = self.monitors or ([(0, 0, *DEMO_SIZE)] if self.args.demo else [])
         return {
             "t": "welcome", "host": socket.gethostname(), "version": VERSION, "demo": self.args.demo,
-            "gamepad": self.pads.available, "audio": self.audio is not None,
+            "gamepad": self.pads.available, "audio": self.audio is not None, "opus": self.opus_ok,
             "clipboard": IS_WINDOWS and not self.args.no_clipboard and not self.args.demo,
             "monitors": [{"w": m[2], "h": m[3]} for m in monitors],
             "cfg": asdict(session.settings), "gpu": self.gpu_name or "",
@@ -1903,12 +2198,21 @@ class HostApp:
                 self.input.move_relative(-1, 0)
         self.video.start(settings)
         if self.audio:
+            if self.session and self.session.audio_codec == "opus":
+                self._start_opus()
+            else:
+                self._stop_opus()
             self.audio.start()
 
     async def stop_streaming(self) -> None:
         await self.video.stop()
+        # Someone may have connected while the video was shutting down (e.g. switching from
+        # the phone to the PC). Their session has already started its own sound; leave it alone.
+        if self.session is not None:
+            return
         if self.audio:
             self.audio.stop()
+        self._stop_opus()
         Windows.keep_awake(display=False)
 
     async def warm_up(self) -> None:
@@ -2027,6 +2331,7 @@ class HostApp:
         await self.video.stop()
         if self.audio:
             self.audio.stop()
+        self._stop_opus()
         self.input.release_all()
         self.pads.remove_all()
         Windows.allow_sleep()
@@ -2197,7 +2502,10 @@ def print_banner(app: HostApp, urls, notes) -> None:
         for text in note.splitlines():
             print(f"  {text}")
     print()
-    print(f"  Sound:      {app.audio.check() if app.audio else 'off (--no-audio)'}")
+    sound = app.audio.check() if app.audio else "off (--no-audio)"
+    if app.audio and app.opus_ok:
+        sound += ", Opus compression"
+    print(f"  Sound:      {sound}")
     print(f"  Gamepad:    {app.pads.status}")
     if app.gpu_name:
         print(f"  Graphics:   {app.gpu_name}")

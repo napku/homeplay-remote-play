@@ -89,10 +89,25 @@ Away from home, your **home upload speed** limits the bitrate. Run a speed test 
 
 **Clipboard.** When the PC and browser are connected, the menu has **Clipboard** buttons: copy text on your phone and "Send clipboard to PC", or copy on the PC and it's offered to the device. Handy for pasting a password, a URL or a game code.
 
-For the smoothest stream:
-- Connect the gaming PC with a cable.
-- Use 5 GHz Wi-Fi on the phone.
-- If the game runs the graphics card at 100 %, cap its frame rate (for example to 60) so the video encoder gets a little time.
+**Sound** is compressed with Opus by default: about 0.15 instead of 1.5 Mbit/s, which leaves more of your connection for the picture. On a fast home network you can tick **Uncompressed sound** in the menu to save another ~10 ms of sound delay.
+
+## Making it as fast as possible
+
+HomePlay already does the following on its own:
+
+- **Picture:** uses the most efficient codec both sides support (AV1 or HEVC before H.264), and keeps every frame small enough that keyframes don't cause a hitch every couple of seconds on a slower connection.
+- **Mouse:** in Chrome and Edge, mouse movement is sent the moment it happens instead of waiting for the next screen refresh, about half a frame sooner on average.
+- **Sound:** Opus compression, plus a buffer that tunes itself. It settles around 25–35 ms on a steady connection and grows only if sound arrives late.
+- **Under load:** HomePlay and FFmpeg run at above-normal priority, Windows isn't allowed to throttle them while a game has the focus, and sound capture uses Windows' multimedia scheduler.
+
+What you can do on your side, most important first:
+
+1. **Make sure Tailscale connects directly.** On a computer you play from, run `tailscale ping <your-pc-name>`. The first replies often say "via DERP(…)" while Tailscale sets up the connection; look at the **last** line. An IP address and port there (like `via 1.2.3.4:41641`) means a direct path. If it stays on "via DERP", your traffic is relayed through a Tailscale server, which adds delay. Tailscale's "connection types" guide explains how to fix that; it's often a router setting.
+2. **Connect the gaming PC with a cable,** and use 5 GHz Wi-Fi on the phone or laptop.
+3. **Use Chrome or Edge** on the device you play from, for the faster mouse path.
+4. **Stream at 120 fps** if both screens can show it. Each frame then reaches you sooner (8 ms per frame instead of 16).
+5. **Cap the game's frame rate** a little below what your graphics card can do (for example 120). A card stuck at 100 % makes the video encoder wait.
+6. Turn on **Stats** in the menu: the round-trip time and "dropped" count show at once whether a change helped.
 
 ## Windows security warnings
 
@@ -165,3 +180,8 @@ HomePlay's strength is that the phone or work PC needs **only a browser**. If yo
 - Without `--lan`, HomePlay only listens on the PC itself (`127.0.0.1`). Only devices signed in to *your* Tailscale account can reach it, through Tailscale's encrypted link.
 - A random password protects every connection. Six wrong tries pause logins for 2 minutes.
 - Only one device plays at a time. Connecting a second one disconnects the first.
+- Sound compression talks to FFmpeg over a loopback-only socket; nothing extra is opened to your network.
+
+## License
+
+MIT, see [LICENSE](LICENSE). You can use, change and share HomePlay freely.

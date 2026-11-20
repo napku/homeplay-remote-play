@@ -148,6 +148,8 @@
   // Which codecs can this device actually decode? Newer ones give a much better
   // picture at the same bitrate, but only some devices (and browsers) handle them.
   let codecSupport = { h264: true, hevc: false, av1: false };
+  // Sound: Opus needs ~1/10 of the data of raw PCM; decoding it needs WebCodecs' AudioDecoder.
+  const audioSupport = { opus: false };
   async function probeCodecs() {
     const can = async (codec) => {
       try { const r = await VideoDecoder.isConfigSupported({ codec, optimizeForLatency: true }); return !!(r && r.supported); }
@@ -158,6 +160,12 @@
       hevc: (await can('hvc1.1.6.L120.90')) || (await can('hev1.1.6.L120.90')),
       av1: await can('av01.0.08M.08'),
     };
+    if (window.AudioDecoder && audioSupport.opus !== null) {
+      try {
+        const r = await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+        audioSupport.opus = !!(r && r.supported);
+      } catch { audioSupport.opus = false; }
+    }
     return codecSupport;
   }
 
@@ -177,6 +185,7 @@
     ws = sock;
     sock.onopen = () => {
       sock.send(JSON.stringify({ t: 'hello', pw: password, cfg: cfgForHost(), codecs: codecSupport,
+                                audio: { opus: !!audioSupport.opus, raw: !!cfg.rawaudio },
                                 touch: touchFirst, ua: ua.slice(0, 200) }));
     };
     sock.onmessage = (ev) => {
@@ -258,6 +267,7 @@
     authed = true;
     hostInfo = m;
     reconnectAttempts = 0;
+    audio.resetCodec();                            // a new session starts a fresh sound stream
     hideToast();
     const first = !inStage;
     showStage();
@@ -357,8 +367,10 @@
       const seq = dv.getUint32(2, true);
       send(['ack', seq]);
       decodeChunk((dv.getUint8(1) & 1) === 1, dv.getUint32(6, true), new Uint8Array(buf, 10));
+    } else if (type === 4) {
+      audio.pushOpus(buf, dv.getUint8(1), dv.getUint16(2, true), dv.getUint32(4, true));
     } else if (type === 3) {
-      audio.push(buf, dv.getUint8(1), dv.getUint32(4, true));
+      audio.push(buf, dv.getUint8(1), dv.getUint16(2, true), dv.getUint32(4, true));
     } else if (type === 1) {
       const n = dv.getUint8(1);                       // [1][codec-string length][codec string][record]
       const codecStr = new TextDecoder().decode(new Uint8Array(buf, 2, n));
@@ -369,6 +381,7 @@
   // ================================================================== audio
   const audio = {
     ctx: null, node: null, gain: null, ready: false,
+    dec: null, decTs: 0, lastSeq: -1, codec: '', bufferMs: 0,
     start() {                                     // must run inside a click / tap
       if (this.ctx) { this.ctx.resume().catch(() => {}); return; }
       const AC = window.AudioContext || window.webkitAudioContext;
@@ -378,17 +391,77 @@
       this.ctx.resume().catch(() => {});
       this.ctx.audioWorklet.addModule('audio-worklet.js').then(() => {
         this.node = new AudioWorkletNode(this.ctx, 'homeplay-pcm', { numberOfInputs: 0, outputChannelCount: [2] });
+        this.node.port.onmessage = (e) => { if (e.data && e.data.bufferMs) this.bufferMs = e.data.bufferMs; };
         this.gain = this.ctx.createGain();
         this.gain.gain.value = volume;
         this.node.connect(this.gain).connect(this.ctx.destination);
         this.ready = true;
       }).catch((e) => console.warn('Audio is not available:', e));
     },
-    push(buf, channels, rate) {
+    gap(seq) {                                     // true when blocks were skipped (the PC went quiet)
+      const skipped = this.lastSeq >= 0 && ((seq - this.lastSeq) & 0xFFFF) > 1;
+      this.lastSeq = seq;
+      return skipped;
+    },
+    wake() { if (this.ctx.state !== 'running') this.ctx.resume().catch(() => {}); },
+    // Raw sound: 16-bit PCM.
+    push(buf, channels, seq, rate) {
       if (!this.ready) return;
-      if (this.ctx.state !== 'running') this.ctx.resume().catch(() => {});
+      this.wake();
+      if (this.codec !== 'PCM') { this.codec = 'PCM'; this.lastSeq = -1; }
       const pcm = new Int16Array(buf.slice(8));
-      this.node.port.postMessage({ pcm, channels, rate }, [pcm.buffer]);
+      this.node.port.postMessage({ pcm, channels, rate, gap: this.gap(seq) }, [pcm.buffer]);
+    },
+    // Compressed sound: one 10 ms Opus packet, decoded by the browser.
+    pushOpus(buf, channels, seq, rate) {
+      if (!this.ready || audioSupport.opus === null) return;
+      this.wake();
+      if (this.codec !== 'Opus') { this.codec = 'Opus'; this.lastSeq = -1; }
+      if (!this.dec) {
+        try {
+          this.dec = new AudioDecoder({ output: (d) => this.onDecoded(d), error: (e) => this.opusFailed(e) });
+          this.dec.configure({ codec: 'opus', sampleRate: rate, numberOfChannels: channels });
+        } catch (e) { this.opusFailed(e); return; }
+      }
+      if (this.dec.state !== 'configured') return;
+      this.pendingGap = this.gap(seq) || this.pendingGap;
+      try {
+        this.dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: this.decTs, data: new Uint8Array(buf, 8) }));
+        this.decTs += 10000;
+      } catch (e) { this.opusFailed(e); }
+    },
+    onDecoded(d) {
+      const n = d.numberOfFrames, ch = d.numberOfChannels;
+      const l = new Float32Array(n), r = new Float32Array(n);
+      try {
+        if (d.format === 'f32') {                  // interleaved float
+          const all = new Float32Array(n * ch);
+          d.copyTo(all, { planeIndex: 0 });
+          for (let i = 0; i < n; i++) { l[i] = all[i * ch]; r[i] = ch > 1 ? all[i * ch + 1] : all[i * ch]; }
+        } else {                                   // planar (natively, or converted by the browser)
+          d.copyTo(l, { planeIndex: 0, format: 'f32-planar' });
+          if (ch > 1) d.copyTo(r, { planeIndex: 1, format: 'f32-planar' }); else r.set(l);
+        }
+        this.node.port.postMessage({ l, r, rate: d.sampleRate, gap: !!this.pendingGap }, [l.buffer, r.buffer]);
+        this.pendingGap = false;
+      } catch (e) {
+        console.warn('Sound frame dropped:', e);
+      } finally {
+        d.close();
+      }
+    },
+    opusFailed(e) {
+      console.warn('This browser could not decode Opus sound; switching to raw sound.', e);
+      this.resetCodec();
+      audioSupport.opus = null;                    // don't offer it again on this device
+      send(['audio', 'pcm', 'failed']);
+    },
+    resetCodec() {
+      if (this.dec) { try { this.dec.close(); } catch { /* already closed */ } }
+      this.dec = null;
+      this.decTs = 0;
+      this.lastSeq = -1;
+      this.codec = '';
     },
     setVolume(v) { if (this.gain) this.gain.gain.value = v; },
   };
@@ -406,7 +479,8 @@
       $('stats').textContent =
         `${fps.toFixed(0)} fps   ${mbps.toFixed(1)} Mbit/s   ${Math.round(stats.rtt)} ms\n` +
         `${videoW}×${videoH}   ${streamInfo.encoder || ''}   ${cap}\n` +
-        `dropped ${stats.hostDrops + stats.lateDrops}`;
+        `dropped ${stats.hostDrops + stats.lateDrops}` +
+        (audio.codec ? `   sound ${audio.codec}${audio.bufferMs ? ' ' + audio.bufferMs + ' ms' : ''}` : '');
     }
     if (connected()) send(['ping', Math.round(now() * 10) / 10]);
   }, 1000);
@@ -688,12 +762,24 @@
     }
   }
 
-  // Hide the menu button while the mouse is resting (desktop).
-  let idleTimer = 0;
+  // Hide the menu button while the mouse is resting (desktop). Throttled: raw mouse events
+  // can arrive ~1000 times a second.
+  let idleTimer = 0, lastPoke = -1e9;
   function poke() {
+    const t = now();
+    if (t - lastPoke < 100) return;
+    lastPoke = t;
     stage.classList.remove('idle');
     clearTimeout(idleTimer);
     if (!touchFirst) idleTimer = setTimeout(() => stage.classList.add('idle'), 2500);
+  }
+
+  // Chrome/Edge: 'pointerrawupdate' hands over mouse movement the moment it happens, while
+  // 'pointermove' is held back to the next animation frame (half a frame later on average).
+  // When it's available it carries all mouse movement and 'pointermove' ignores the mouse.
+  const RAW_POINTER = 'onpointerrawupdate' in window;
+  if (RAW_POINTER) {
+    surface.addEventListener('pointerrawupdate', (e) => { if (e.pointerType === 'mouse') onMouseMove(e); });
   }
 
   // ================================================================== touch: trackpad / tap to click
@@ -729,7 +815,7 @@
   });
 
   surface.addEventListener('pointermove', (e) => {
-    if (e.pointerType === 'mouse') { onMouseMove(e); return; }
+    if (e.pointerType === 'mouse') { if (!RAW_POINTER) onMouseMove(e); return; }
     const t = touches.get(e.pointerId);
     if (!t || !gesture) return;
     lastTouch = now();
@@ -898,7 +984,7 @@
   }
   function startPadPolling() {
     const any = navigator.getGamepads && [...navigator.getGamepads()].some((g) => g && g.connected);
-    if (!padTimer && any) padTimer = setInterval(pollPads, 8);
+    if (!padTimer && any) padTimer = setInterval(pollPads, 4);    // ~250 Hz: controllers report at 125-250 Hz
   }
   window.addEventListener('gamepadconnected', (e) => {
     showToast('Controller connected: ' + e.gamepad.id.replace(/\(.*\)/, '').trim(), 2500);
@@ -964,6 +1050,8 @@
     updateMenuInfo();
     $('clipSection').classList.toggle('hidden', !hostInfo.clipboard);
     $('clipFromPc').disabled = !pcClipboard;
+    $('rawAudioField').classList.toggle('hidden', !(hostInfo.opus && audioSupport.opus));
+    $('rawAudio').checked = !!cfg.rawaudio;
     menu.classList.remove('hidden');
   }
   function closeMenu() {
@@ -983,6 +1071,12 @@
   $('kbBtn').addEventListener('click', () => {
     menu.classList.add('hidden');
     kbInput.focus({ preventScroll: true });      // the phone's keyboard opens; its own button hides it
+  });
+  $('rawAudio').addEventListener('change', (e) => {
+    cfg.rawaudio = e.target.checked;
+    store.set('cfg', cfg);
+    send(['audio', cfg.rawaudio ? 'pcm' : 'opus']);
+    showToast(cfg.rawaudio ? 'Sound: uncompressed' : 'Sound: compressed (Opus)', 2000);
   });
   $('clipToPc').addEventListener('click', () => { sendClipboardToPc(); closeMenu(); });
   $('clipFromPc').addEventListener('click', () => { copyPcClipboardHere(); closeMenu(); });
