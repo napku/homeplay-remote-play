@@ -221,3 +221,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- HomePlay ---
+# Holds the password that controls your PC (created on first run)
+homeplay_config.json
+# Self-signed certificate for --lan mode
+certs/
+# A local copy of FFmpeg, if you drop one in
+ffmpeg/
+# OS cruft
+.DS_Store
+Thumbs.db

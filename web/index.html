@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d12">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="HomePlay">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
+<title>HomePlay</title>
+</head>
+<body>
+
+<!-- ============================ Login ============================ -->
+<main id="login">
+  <div class="card">
+    <div class="brand">
+      <img src="icon.svg" alt="" width="44" height="44">
+      <div>
+        <h1>HomePlay</h1>
+        <p class="sub">Play on your home PC from here</p>
+      </div>
+    </div>
+
+    <form id="loginForm" autocomplete="on">
+      <label class="field">
+        <span>Password</span>
+        <input id="pw" type="password" autocomplete="current-password" autocapitalize="off"
+               spellcheck="false" placeholder="Shown on your PC" required>
+      </label>
+      <label class="check"><input id="remember" type="checkbox" checked> Remember on this device</label>
+
+      <details id="qualityBox">
+        <summary>Stream quality</summary>
+        <div class="grid3">
+          <label class="field"><span>Resolution</span><select id="resLogin"></select></label>
+          <label class="field"><span>Frame rate</span><select id="fpsLogin"></select></label>
+          <label class="field"><span id="kbpsLoginLabel">Bitrate</span><select id="kbpsLogin"></select></label>
+        </div>
+        <label class="check"><input id="autoLogin" type="checkbox"> Auto — match my connection</label>
+        <p class="small">Auto lets the PC pick the bitrate for you. Otherwise lower it if the picture stutters (phones on mobile data: 5–8 Mbit/s).</p>
+      </details>
+
+      <button id="connectBtn" class="primary" type="submit">Connect</button>
+      <p id="loginMsg" class="msg" role="alert"></p>
+    </form>
+    <p id="envHint" class="small hint-line"></p>
+  </div>
+</main>
+
+<!-- ============================ Stream ============================ -->
+<div id="stage" class="hidden">
+  <canvas id="video" width="1280" height="720"></canvas>
+  <div id="surface" tabindex="-1"></div>
+
+  <!-- On-screen controller (touch screens) -->
+  <div id="pad" class="hidden" aria-label="On-screen controller">
+    <div class="shoulder left">
+      <button class="pbtn pill" data-btn="LT">LT</button>
+      <button class="pbtn pill" data-btn="LB">LB</button>
+    </div>
+    <div class="shoulder right">
+      <button class="pbtn pill" data-btn="RB">RB</button>
+      <button class="pbtn pill" data-btn="RT">RT</button>
+    </div>
+    <div class="stick" id="stickL" data-stick="L"><div class="knob"></div></div>
+    <button class="pbtn small thumb" id="btnL3" data-btn="LS">L3</button>
+    <div class="dpad" id="dpad">
+      <span class="arrow up"></span><span class="arrow right"></span>
+      <span class="arrow down"></span><span class="arrow left"></span>
+    </div>
+    <div class="face" id="face">
+      <button class="pbtn y" data-btn="Y">Y</button>
+      <button class="pbtn x" data-btn="X">X</button>
+      <button class="pbtn b" data-btn="B">B</button>
+      <button class="pbtn a" data-btn="A">A</button>
+    </div>
+    <div class="stick" id="stickR" data-stick="R"><div class="knob"></div></div>
+    <button class="pbtn small thumb" id="btnR3" data-btn="RS">R3</button>
+    <div class="center-btns">
+      <button class="pbtn pill small" data-btn="BACK" aria-label="View / Back">&#x29C9;</button>
+      <button class="pbtn pill small" data-btn="START" aria-label="Menu / Start">&#x2261;</button>
+    </div>
+    <div class="rotate">Turn your phone sideways to use the controller</div>
+  </div>
+
+  <textarea id="kbInput" aria-label="Keyboard input" autocomplete="off" autocorrect="off"
+            autocapitalize="off" spellcheck="false" enterkeyhint="send"></textarea>
+
+  <div id="stats" class="hidden"></div>
+  <div id="hint" class="hidden"></div>
+  <div id="toast" class="hidden" role="status"></div>
+  <button id="menuBtn" aria-label="Open menu"><span></span><span></span><span></span></button>
+
+  <!-- ============================ Menu ============================ -->
+  <aside id="menu" class="hidden" aria-label="Menu">
+    <header>
+      <div>
+        <strong id="menuHost">HomePlay</strong>
+        <div id="menuInfo" class="small"></div>
+      </div>
+      <button id="menuClose" class="icon" aria-label="Close menu">&#x2715;</button>
+    </header>
+
+    <section class="row">
+      <button id="fsBtn">Full screen</button>
+      <button id="kbBtn" class="touch-only">Keyboard</button>
+      <button id="statsBtn">Stats</button>
+    </section>
+
+    <section class="mouse-only">
+      <h3>Mouse</h3>
+      <div class="seg" id="mouseSeg">
+        <button data-v="game">Game mode</button>
+        <button data-v="desktop">Desktop mode</button>
+      </div>
+      <p class="small" id="mouseHelp"></p>
+    </section>
+
+    <section class="touch-only">
+      <h3>Touch controls</h3>
+      <div class="seg" id="touchSeg">
+        <button data-v="trackpad">Trackpad</button>
+        <button data-v="direct">Tap to click</button>
+        <button data-v="pad">Controller</button>
+      </div>
+      <p class="small" id="touchHelp"></p>
+      <label class="field inline"><span>Trackpad speed</span>
+        <input id="sens" type="range" min="0.5" max="4" step="0.1"></label>
+    </section>
+
+    <section>
+      <h3>Send keys</h3>
+      <div class="keys">
+        <button data-combo="Escape">Esc</button>
+        <button data-combo="Tab">Tab</button>
+        <button data-combo="Enter">Enter</button>
+        <button data-combo="MetaLeft">Win</button>
+        <button data-combo="AltLeft+Tab">Alt+Tab</button>
+        <button data-combo="AltLeft+Enter">Alt+Enter</button>
+        <button data-combo="AltLeft+F4">Alt+F4</button>
+        <button data-combo="ControlLeft+ShiftLeft+Escape">Task Mgr</button>
+        <button data-combo="F11">F11</button>
+      </div>
+    </section>
+
+    <section>
+      <h3>Stream</h3>
+      <div class="grid3">
+        <label class="field"><span>Resolution</span><select id="resMenu"></select></label>
+        <label class="field"><span>Frame rate</span><select id="fpsMenu"></select></label>
+        <label class="field"><span id="kbpsMenuLabel">Bitrate</span><select id="kbpsMenu"></select></label>
+      </div>
+      <label class="check"><input id="autoMenu" type="checkbox"> Auto bitrate — let the PC match the connection</label>
+      <div class="grid3">
+        <label class="field" id="monField"><span>Screen</span><select id="monMenu"></select></label>
+        <label class="field"><span>Codec</span><select id="codecMenu">
+          <option value="auto">Auto (best)</option>
+          <option value="h264">H.264</option>
+          <option value="hevc">HEVC</option>
+          <option value="av1">AV1</option>
+        </select></label>
+      </div>
+      <button id="applyBtn" class="primary">Apply</button>
+    </section>
+
+    <section id="clipSection" class="hidden">
+      <h3>Clipboard</h3>
+      <div class="row">
+        <button id="clipToPc">Send clipboard to PC</button>
+        <button id="clipFromPc" disabled>Copy PC clipboard here</button>
+      </div>
+      <p class="small">Copy on one device, paste on the other.</p>
+    </section>
+
+    <section>
+      <h3>Sound</h3>
+      <label class="field inline"><span>Volume</span>
+        <input id="vol" type="range" min="0" max="1.5" step="0.05"></label>
+    </section>
+
+    <section>
+      <button id="disconnectBtn" class="danger">Disconnect</button>
+      <p class="small mouse-only">Shortcut: Ctrl+Alt+Shift+M opens this menu.</p>
+    </section>
+  </aside>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

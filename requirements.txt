@@ -1,0 +1,5 @@
+# HomePlay itself only needs the Python standard library.
+# These add the PC's sound to the stream (start.bat installs them for you):
+numpy
+soundcard>=0.4.6
+# Controller support is installed separately by start.bat:  pip install vgamepad
