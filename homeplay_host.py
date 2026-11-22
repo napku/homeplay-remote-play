@@ -361,6 +361,8 @@ class Windows:
         try:
             if not u.IsClipboardFormatAvailable(13):           # CF_UNICODETEXT
                 return None
+            if Windows._clipboard_is_sensitive(u):
+                return None
             handle = u.GetClipboardData(13)
             if not handle:
                 return None
@@ -373,6 +375,19 @@ class Windows:
                 k.GlobalUnlock(handle)
         finally:
             u.CloseClipboard()
+
+    @staticmethod
+    def _clipboard_is_sensitive(u) -> bool:
+        """True if the program that copied this marked it as private. Password managers do that with the
+        'ExcludeClipboardContentFromMonitorProcessing' format so clipboard tools leave the text alone.
+        The clipboard must be open. If the check itself fails, the text counts as ordinary."""
+        try:
+            u.RegisterClipboardFormatW.argtypes = (wintypes.LPCWSTR,)
+            u.RegisterClipboardFormatW.restype = ctypes.c_uint
+            fmt = u.RegisterClipboardFormatW("ExcludeClipboardContentFromMonitorProcessing")
+            return bool(fmt and u.IsClipboardFormatAvailable(fmt))
+        except Exception:
+            return False
 
     @staticmethod
     def set_clipboard_text(text: str) -> bool:
