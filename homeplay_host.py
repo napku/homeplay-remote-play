@@ -67,6 +67,7 @@ CLOSE_BAD_PASSWORD = 4001
 CLOSE_REPLACED = 4002
 CLOSE_LOCKED_OUT = 4003
 CLOSE_PROTOCOL = 4004
+CLOSE_BUSY = 4005
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -1720,6 +1721,7 @@ HTTP_REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found
                 405: "Method Not Allowed", 503: "Service Unavailable"}
 MAX_CONNECTIONS = 32
 MAX_LOGIN_GUARDS = 1024
+MAX_FAILED_LOGINS_SERVER = 30
 
 
 async def http_response(writer, status: int, body: bytes = b"", content_type="text/plain; charset=utf-8",
@@ -1766,11 +1768,13 @@ def host_port(value: str, default_port: int):
 # ======================================================================================
 
 class LoginGuard:
-    """After 6 wrong passwords within 10 minutes, this client's logins pause for 2 minutes."""
+    """Pause login attempts after repeated failures within a 10-minute window."""
 
-    def __init__(self):
+    def __init__(self, max_failures: int = 6, scope: str = "client"):
         self.failures = collections.deque()
         self.locked_until = 0.0
+        self.max_failures = max_failures
+        self.scope = scope
 
     def locked(self) -> bool:
         return time.monotonic() < self.locked_until
@@ -1780,10 +1784,10 @@ class LoginGuard:
         self.failures.append(now)
         while self.failures and now - self.failures[0] > 600:
             self.failures.popleft()
-        if len(self.failures) >= 6:
+        if len(self.failures) >= self.max_failures:
             self.failures.clear()
             self.locked_until = now + 120
-            log.warning("Too many wrong passwords - this client's logins are paused for 2 minutes.")
+            log.warning("Too many wrong passwords - this %s's logins are paused for 2 minutes.", self.scope)
 
     def succeeded(self) -> None:
         self.failures.clear()
@@ -2120,6 +2124,7 @@ class Session:
 
 class HostApp:
     MAX_PENDING_LOGINS = 16
+    MAX_PENDING_LOGINS_PER_PEER = 4
     HELLO_MAX_BYTES = 16384
 
     def __init__(self, args, password: str, ff: FFmpeg):
@@ -2128,8 +2133,10 @@ class HostApp:
         self.ff = ff
         self.loop = asyncio.get_running_loop()
         self.login_guards = collections.OrderedDict()
+        self.global_login_guard = LoginGuard(MAX_FAILED_LOGINS_SERVER, "server")
         self.connection_count = 0
         self.pending_logins = 0
+        self.pending_logins_by_peer = collections.Counter()
         self.extra_hosts = {str(h).strip().lower() for h in (getattr(args, "allow_host", None) or [])
                             if str(h).strip()}
         self.tailscale_hosts: set[str] = set()
@@ -2366,7 +2373,7 @@ class HostApp:
         self.connection_count += 1
         try:
             try:
-                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 15)
+                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
             except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError,
                     ConnectionError, OSError, ssl.SSLError):
                 return
@@ -2478,13 +2485,20 @@ class HostApp:
         who = clean_for_log(identity)
         guard_key = f"tailscale:{identity.casefold()}" if claimed else str(peer_host)
         guard = self.login_guard_for(guard_key)
+        global_guard = self.global_login_guard
+        if global_guard.locked():
+            await ws.close(CLOSE_LOCKED_OUT, "Too many wrong passwords")
+            return
         if guard.locked():
             await ws.close(CLOSE_LOCKED_OUT, "Too many wrong passwords")
             return
-        if self.pending_logins >= self.MAX_PENDING_LOGINS:
-            await ws.close(CLOSE_LOCKED_OUT, "Too many logins at once")
+        pending_key = str(peer_host)
+        if (self.pending_logins >= self.MAX_PENDING_LOGINS
+                or self.pending_logins_by_peer[pending_key] >= self.MAX_PENDING_LOGINS_PER_PEER):
+            await ws.close(CLOSE_BUSY, "Too many logins at once")
             return
         self.pending_logins += 1
+        self.pending_logins_by_peer[pending_key] += 1
         try:
             ws.MAX_MESSAGE = self.HELLO_MAX_BYTES
             try:
@@ -2497,13 +2511,14 @@ class HostApp:
                 await ws.close(CLOSE_PROTOCOL, "Expected hello")
                 return
             # Re-check after reading hello so simultaneous attempts cannot pass the guard together.
-            if guard.locked():
+            if global_guard.locked() or guard.locked():
                 await ws.close(CLOSE_LOCKED_OUT, "Too many wrong passwords")
                 return
             password = hello.get("pw")
             if not isinstance(password, str) or not hmac.compare_digest(
                     password.strip().encode("utf-8"), self.password.encode("utf-8")):
                 guard.failed()
+                global_guard.failed()
                 log.warning("Wrong password from %s", who)
                 await asyncio.sleep(1.0)
                 await ws.close(CLOSE_BAD_PASSWORD, "Wrong password")
@@ -2512,6 +2527,9 @@ class HostApp:
             ws.MAX_MESSAGE = WebSocket.MAX_MESSAGE
         finally:
             self.pending_logins -= 1
+            self.pending_logins_by_peer[pending_key] -= 1
+            if self.pending_logins_by_peer[pending_key] <= 0:
+                self.pending_logins_by_peer.pop(pending_key, None)
         session = Session(self, ws, hello, who)
         async with self.session_lock:
             old, self.session = self.session, session

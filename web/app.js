@@ -209,6 +209,7 @@
     if (code === 4001) { store.remove('pw'); showLogin('Wrong password.'); return; }
     if (code === 4002) { showLogin('Another device connected, so this one was disconnected.', true); return; }
     if (code === 4003) { showLogin('Too many wrong passwords. Wait two minutes and try again.'); return; }
+    if (code === 4005) { showLogin('Too many login attempts at once. Wait a few seconds and try again.'); return; }
     if (userLeft) { showLogin('Disconnected.', true); return; }
     if (!inStage) { showLogin("Can't reach the PC. Is HomePlay running there?"); return; }
     if (wasAuthed) reconnectAttempts = 0;
