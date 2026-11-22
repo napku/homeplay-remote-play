@@ -2472,9 +2472,8 @@ class HostApp:
         ws = WebSocket(reader, writer)
         claimed = ""
         if peer_is_loopback:
+            # Forwarded client IPs are not authenticated identities and can be spoofed.
             claimed = headers.get("tailscale-user-login", "").strip()
-            if not claimed:
-                claimed = headers.get("x-forwarded-for", "").split(",")[0].strip()
         identity = clean_for_log(claimed or str(peer_host), 200)
         who = clean_for_log(identity)
         guard_key = f"tailscale:{identity.casefold()}" if claimed else str(peer_host)
