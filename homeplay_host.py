@@ -134,6 +134,7 @@ def clamp_int(value, lo: int, hi: int) -> int:
     return lo if v < lo else hi if v > hi else v
 
 
+MIN_PASSWORD_LENGTH = 10      # the shortest password --password accepts
 PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"   # no look-alikes (i/l/1, o/0)
 
 
@@ -181,6 +182,11 @@ def describe_device(user_agent: str) -> str:
     browser = ("Edge" if "Edg/" in ua else "Firefox" if "Firefox/" in ua else "Chrome" if "Chrome/" in ua
                else "Safari" if "Safari/" in ua else "browser")
     return f"{device} ({browser})"
+
+
+def clean_for_log(text: str, limit: int = 80) -> str:
+    """Printable ASCII only, and short: header values come from the other side and end up in the log."""
+    return re.sub(r"[^\x20-\x7e]", "?", text)[:limit]
 
 
 # ======================================================================================
@@ -355,6 +361,8 @@ class Windows:
         try:
             if not u.IsClipboardFormatAvailable(13):           # CF_UNICODETEXT
                 return None
+            if Windows._clipboard_is_sensitive(u):
+                return None
             handle = u.GetClipboardData(13)
             if not handle:
                 return None
@@ -367,6 +375,19 @@ class Windows:
                 k.GlobalUnlock(handle)
         finally:
             u.CloseClipboard()
+
+    @staticmethod
+    def _clipboard_is_sensitive(u) -> bool:
+        """True if the program that copied this marked it as private. Password managers do that with the
+        'ExcludeClipboardContentFromMonitorProcessing' format so clipboard tools leave the text alone.
+        The clipboard must be open. If the check itself fails, the text counts as ordinary."""
+        try:
+            u.RegisterClipboardFormatW.argtypes = (wintypes.LPCWSTR,)
+            u.RegisterClipboardFormatW.restype = ctypes.c_uint
+            fmt = u.RegisterClipboardFormatW("ExcludeClipboardContentFromMonitorProcessing")
+            return bool(fmt and u.IsClipboardFormatAvailable(fmt))
+        except Exception:
+            return False
 
     @staticmethod
     def set_clipboard_text(text: str) -> bool:
@@ -1673,7 +1694,8 @@ CONTENT_TYPES = {
     ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
     ".webmanifest": "application/manifest+json", ".json": "application/json", ".ico": "image/x-icon",
 }
-HTTP_REASONS = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed"}
+HTTP_REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found",
+                405: "Method Not Allowed"}
 
 
 async def http_response(writer, status: int, body: bytes = b"", content_type="text/plain; charset=utf-8",
@@ -1700,6 +1722,18 @@ def parse_request(head: bytes):
             headers[name.strip().lower()] = value.strip()
     path = urllib.parse.urlsplit(parts[1]).path or "/"
     return parts[0].upper(), path, headers
+
+
+def host_port(value: str, default_port: int):
+    """'Name', 'name:8080' or '[::1]:8080' -> (lower-case name, port), or None if it makes no sense."""
+    try:
+        parts = urllib.parse.urlsplit("//" + value.strip().lower())
+        name, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not name or parts.username is not None or parts.path or parts.query or parts.fragment:
+        return None
+    return name, port or default_port
 
 
 # ======================================================================================
@@ -2035,12 +2069,22 @@ class Session:
 # ======================================================================================
 
 class HostApp:
+    MAX_PENDING_LOGINS = 16     # connections that have not logged in yet
+    HELLO_MAX_BYTES = 16384     # the first message (the login) is small
+
     def __init__(self, args, password: str, ff: FFmpeg):
         self.args = args
         self.password = password
         self.ff = ff
         self.loop = asyncio.get_running_loop()
         self.guard = LoginGuard()
+        self.pending_logins = 0
+        # Extra host names a browser may use to reach this server (--allow-host, plus the Tailscale address).
+        self.extra_hosts = {h.strip().lower() for h in (getattr(args, "allow_host", None) or []) if h.strip()}
+        # Names are only checked when the server listens on this PC alone (the default, behind Tailscale).
+        # With --lan or --bind the addresses people use are not known in advance.
+        self.check_host = not args.lan and (args.bind or "127.0.0.1") in ("127.0.0.1", "localhost", "::1")
+        self.own_names = {"localhost", socket.gethostname().lower()}
         self.gpu_name, self.gpu_vendor, self.monitors = Windows.display_info()
         self.input = WindowsInput() if (IS_WINDOWS and not args.demo) else LoggedInput()
         self.pads = GamepadHub(not args.no_gamepad, args.demo, self.loop, self._on_rumble)
@@ -2272,11 +2316,57 @@ class HostApp:
         await http_response(writer, 200, body if method == "GET" else b"", content_type,
                             length=len(body), extra={"Cache-Control": "no-cache"})
 
+    def host_allowed(self, name: str) -> bool:
+        """Is this a name that really leads to this PC? (Guards against DNS rebinding, where a web
+        page's own host name is made to point at this PC.)"""
+        if name in self.own_names or name in self.extra_hosts or name.endswith((".localhost", ".ts.net")):
+            return True
+        try:
+            ipaddress.ip_address(name)            # a bare address: there is no name to rebind
+            return True
+        except ValueError:
+            return False
+
+    def origin_problem(self, headers: dict) -> str | None:
+        """Why this WebSocket handshake must be refused, or None if it is fine.
+
+        A browser always sends an Origin header with a WebSocket handshake, and a web page cannot change
+        the other headers. So a page from another site (open in a browser on this PC or on your Tailscale
+        network) shows up as an Origin that is not this server's own address. Programs that are not
+        browsers send no Origin; for them the password is the only gate."""
+        origin = headers.get("origin")
+        if origin is None:
+            return None
+        try:
+            o = urllib.parse.urlsplit(origin.strip().lower())
+            o_name, o_port = o.hostname, o.port
+        except ValueError:
+            return "malformed Origin header"
+        if o.scheme not in ("http", "https") or not o_name:
+            return f"page origin {clean_for_log(origin, 40)!r}"
+        if o_name in self.extra_hosts:
+            return None
+        default_port = 443 if o.scheme == "https" else 80
+        wanted = (o_name, o_port or default_port)
+        # Behind Tailscale the original address may arrive in X-Forwarded-Host instead of Host.
+        claims = (headers.get("host", ""), headers.get("x-forwarded-host", "").split(",")[0])
+        if not any(host_port(c, default_port) == wanted for c in claims):
+            return f"page from {clean_for_log(origin, 40)!r}"
+        if self.check_host and not self.host_allowed(o_name):
+            return f"address {clean_for_log(o_name, 40)!r}"
+        return None
+
     async def handle_websocket(self, reader, writer, headers: dict) -> None:
         key = headers.get("sec-websocket-key", "")
         if headers.get("upgrade", "").lower() != "websocket" or not key \
                 or headers.get("sec-websocket-version") != "13":
             await http_response(writer, 400, b"Expected a WebSocket request")
+            return
+        problem = self.origin_problem(headers)
+        if problem:
+            log.warning("Refused a connection from a web page that is not HomePlay's own (%s). If you open "
+                        "HomePlay at this address on purpose, start it with --allow-host NAME.", problem)
+            await http_response(writer, 403, b"Forbidden: this web page may not connect to HomePlay")
             return
         accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
         writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -2284,29 +2374,53 @@ class HostApp:
         await writer.drain()
         ws = WebSocket(reader, writer)
         peer = writer.get_extra_info("peername")
-        who = (headers.get("tailscale-user-login") or headers.get("x-forwarded-for", "").split(",")[0].strip()
-               or (peer[0] if peer else "unknown"))
+        peer_ip = str(peer[0]) if peer else "unknown"
+        claimed = ""
+        if peer_ip in ("127.0.0.1", "::1"):
+            # Only the local Tailscale proxy is believed about who is on the other end: a device that
+            # connects directly (--lan) could write anything into these headers.
+            claimed = (headers.get("tailscale-user-login")
+                       or headers.get("x-forwarded-for", "").split(",")[0].strip())
+        who = clean_for_log(claimed or peer_ip)
         if self.guard.locked():
             await ws.close(CLOSE_LOCKED_OUT, "Too many wrong passwords")
             return
+        if self.pending_logins >= self.MAX_PENDING_LOGINS:
+            await ws.close(CLOSE_LOCKED_OUT, "Too many logins at once")
+            return
+        # Until the password has been checked (including the pause after a wrong guess) this
+        # connection counts as "waiting to log in", so one client cannot run a flood of guesses
+        # side by side.
+        self.pending_logins += 1
         try:
-            first = await asyncio.wait_for(ws.recv(), 20)
-            hello = json.loads(first[1]) if first and first[0] == 0x1 else None
-        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, ConnectionError,
-                OSError, WebSocketProtocolError):
-            hello = None
-        if not isinstance(hello, dict) or hello.get("t") != "hello":
-            await ws.close(CLOSE_PROTOCOL, "Expected hello")
-            return
-        password = hello.get("pw")
-        if not isinstance(password, str) or not hmac.compare_digest(
-                password.strip().encode("utf-8"), self.password.encode("utf-8")):
-            self.guard.failed()
-            log.warning("Wrong password from %s", who)
-            await asyncio.sleep(1.0)
-            await ws.close(CLOSE_BAD_PASSWORD, "Wrong password")
-            return
-        self.guard.succeeded()
+            ws.MAX_MESSAGE = self.HELLO_MAX_BYTES      # nobody is logged in yet: the first message is small
+            try:
+                first = await asyncio.wait_for(ws.recv(), 20)
+                hello = json.loads(first[1]) if first and first[0] == 0x1 else None
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, ConnectionError,
+                    OSError, WebSocketProtocolError):
+                hello = None
+            if not isinstance(hello, dict) or hello.get("t") != "hello":
+                await ws.close(CLOSE_PROTOCOL, "Expected hello")
+                return
+            # Look at the lock again: other connections may have used up the guesses while this one
+            # was waiting for its hello. Nothing awaits between this check and guard.failed(), so each
+            # guess is counted before the next one is even looked at.
+            if self.guard.locked():
+                await ws.close(CLOSE_LOCKED_OUT, "Too many wrong passwords")
+                return
+            password = hello.get("pw")
+            if not isinstance(password, str) or not hmac.compare_digest(
+                    password.strip().encode("utf-8"), self.password.encode("utf-8")):
+                self.guard.failed()
+                log.warning("Wrong password from %s", who)
+                await asyncio.sleep(1.0)
+                await ws.close(CLOSE_BAD_PASSWORD, "Wrong password")
+                return
+            self.guard.succeeded()
+            ws.MAX_MESSAGE = WebSocket.MAX_MESSAGE
+        finally:
+            self.pending_logins -= 1
         session = Session(self, ws, hello, who)
         async with self.session_lock:
             old, self.session = self.session, session
@@ -2463,6 +2577,9 @@ def parse_args(argv=None):
     p.add_argument("--cert", help="certificate file (PEM) for --https")
     p.add_argument("--key", help="private key file (PEM) for --https")
     p.add_argument("--bind", help="address to listen on (default 127.0.0.1, or 0.0.0.0 with --lan)")
+    p.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                   help="also accept web pages opened from this host name (repeat for more); only needed "
+                        "if you reach HomePlay through your own domain or reverse proxy")
     p.add_argument("--password", help="set a new password and remember it")
     p.add_argument("--new-password", action="store_true", help="make up a new random password")
     p.add_argument("--fps", type=int, default=60, help="default frame rate (the browser can change it)")
@@ -2523,6 +2640,9 @@ async def run_host(args, password: str, ff: FFmpeg) -> None:
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.load_cert_chain(cert, key)
     bind = args.bind or ("0.0.0.0" if args.lan else "127.0.0.1")
+    if ssl_context is None and bind not in ("127.0.0.1", "localhost", "::1"):
+        log.warning("Listening on %s without HTTPS: the password and every key you press would cross the "
+                    "network unencrypted. Use --lan or --https, or keep the default (this PC only).", bind)
     try:
         server = await asyncio.start_server(app.handle_connection, bind, args.port, ssl=ssl_context,
                                             limit=65536)
@@ -2540,6 +2660,9 @@ async def run_host(args, password: str, ff: FFmpeg) -> None:
         ts_url, advice = await asyncio.to_thread(Tailscale.setup, args.port, args.tailscale)
         if ts_url:
             urls.append(("Anywhere:", f"{ts_url}   (via Tailscale)"))
+            ts_host = urllib.parse.urlsplit(ts_url).hostname
+            if ts_host:                           # pages opened from this address are HomePlay's own
+                app.extra_hosts.add(ts_host.lower())
         if advice:
             notes.append(advice)
     Windows.keep_awake(display=False)          # the PC must stay awake so you can connect
@@ -2573,9 +2696,16 @@ def main(argv=None) -> None:
     config = load_config()
     if args.password:
         config["password"] = args.password.strip()
+        if len(config["password"]) < MIN_PASSWORD_LENGTH:
+            raise SystemExit(f"The password must have at least {MIN_PASSWORD_LENGTH} characters. After 6 wrong "
+                             "tries logins only pause for 2 minutes, so a short password can still be guessed.\n"
+                             "Use a longer phrase, or leave out --password to get a random one.")
     elif args.new_password or not config.get("password"):
         config["password"] = generate_password()
     save_config(config)
+    if len(str(config["password"])) < MIN_PASSWORD_LENGTH:
+        log.warning("The saved password is short and could be guessed. Run start.bat --new-password for a "
+                    "random one, or choose a longer one with --password.")
 
     ff = FFmpeg(ffmpeg_path)
     ff.inspect()

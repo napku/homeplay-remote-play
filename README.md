@@ -24,7 +24,7 @@ It automatically uses the best video codec your device can handle — **HEVC or 
 
 ## 1. Set up the gaming PC (once)
 
-1. Download the project (on GitHub: **Code → Download ZIP**) and unzip it somewhere permanent, for example `C:\HomePlay`. Before you unzip, right-click the downloaded **`.zip`**, choose **Properties**, tick **Unblock** at the bottom, then **OK**. That stops Windows putting a warning on every file inside. (If you forget, see [Windows security warnings](#windows-security-warnings) below.)
+1. Download the project (on GitHub: **Code → Download ZIP**) and unzip it somewhere permanent **inside your own user folder**, for example `C:\Users\<your name>\HomePlay`. Don't put it directly in `C:\`: other user accounts on the PC can usually change files there, and HomePlay holds the password that controls your PC (see [Security](#security)). Before you unzip, right-click the downloaded **`.zip`**, choose **Properties**, tick **Unblock** at the bottom, then **OK**. That stops Windows putting a warning on every file inside. (If you forget, see [Windows security warnings](#windows-security-warnings) below.)
 2. Double-click **`start.bat`**. If a blue **"Windows protected your PC"** box appears, click **More info**, then **Run anyway** — this is expected for any new program that isn't from a big company, and is explained below. The first start takes a minute or two. During that first start it:
    - creates a private Python environment in the folder;
    - installs sound support;
@@ -132,7 +132,7 @@ HomePlay is a small, unsigned program that captures your screen and replays keyb
 |---|---|
 | "Can't reach the PC" | Is `start.bat` running? Is Tailscale switched on, on **both** devices? Is the PC asleep? HomePlay keeps the PC awake while it runs, but it can't wake a PC that's already asleep. Turn off sleep in Windows power settings. |
 | "Couldn't start the screen capture" | The PC is locked (Win+L) or a UAC prompt is showing. Windows doesn't let other programs see those screens. Sign in on the PC. To avoid this, let the screen turn off but don't lock the PC: Settings, Accounts, Sign-in options, "If you've been away…", set to **Never**. |
-| A game ignores keyboard/mouse/controller | The game runs as administrator. Right-click `start.bat` and choose **Run as administrator**. |
+| A game ignores keyboard/mouse/controller | The game runs as administrator. Right-click `start.bat` and choose **Run as administrator**. Only do this if the HomePlay folder is in your own user folder: a program that runs as administrator from a folder other users can change lets them take over the PC. |
 | No sound | Check the **Sound:** line in the HomePlay window. HomePlay records the PC's *default* playback device. |
 | Controller does nothing | Check the **Gamepad:** line. Install the ViGEmBus driver ([releases page](https://github.com/nefarius/ViGEmBus/releases)), then restart HomePlay. |
 | "This page has to be opened with https://" | Use the Tailscale address `https://….ts.net`, or `http://localhost:8080` on the PC itself. A plain `http://192.168…` address won't work. |
@@ -157,6 +157,7 @@ Options (add them after `start.bat`):
 | `--no-audio`, `--no-gamepad`, `--no-clipboard` | Turn those parts off. |
 | `--lan` | Also accept devices on your home network directly. This uses HTTPS with a self-signed certificate: the browser shows a warning, and iPhones may refuse it. It needs `pip install cryptography`. |
 | `--https --cert file.pem --key key.pem` | Serve HTTPS with your own certificate. |
+| `--allow-host NAME` | Also accept web pages opened from this host name (repeat for more). Only needed if you reach HomePlay through your own domain or reverse proxy; `localhost` and your Tailscale address work without it. |
 | `--demo` | Stream a test picture and only *log* input. Good for testing. |
 
 **Port forwarding instead of Tailscale.** Not recommended. If you really want it, use `--lan`, forward that one TCP port on your router, and use a long password. Preferably also get a real certificate for your own domain (`--cert`/`--key`). Anyone who guesses the password controls your PC. After 6 wrong passwords, logins pause for 2 minutes.
@@ -165,7 +166,7 @@ Options (add them after `start.bat`):
 
 **Stop sharing over Tailscale.** Run `tailscale serve reset`.
 
-**Files.** `homeplay_config.json` holds your password. `certs\` is only used with `--lan`. `allow-in-defender.bat` is the optional antivirus helper (see [Windows security warnings](#windows-security-warnings)). Everything else is the program. To uninstall, delete the folder and run `tailscale serve reset`; if you ran the Defender helper, also run `powershell Remove-MpPreference -ExclusionPath "C:\HomePlay"` as administrator.
+**Files.** `homeplay_config.json` holds your password. `certs\` is only used with `--lan`. `allow-in-defender.bat` is the optional antivirus helper (see [Windows security warnings](#windows-security-warnings)). Everything else is the program. To uninstall, delete the folder and run `tailscale serve reset`; if you ran the Defender helper, also run `powershell Remove-MpPreference -ExclusionPath "<the HomePlay folder>"` as administrator.
 
 ## How it compares
 
@@ -178,9 +179,13 @@ HomePlay's strength is that the phone or work PC needs **only a browser**. If yo
 ## Security
 
 - Without `--lan`, HomePlay only listens on the PC itself (`127.0.0.1`). Only devices signed in to *your* Tailscale account can reach it, through Tailscale's encrypted link.
-- A random password protects every connection. Six wrong tries pause logins for 2 minutes.
+- A random password protects every connection. Six wrong tries pause logins for 2 minutes, for every device, and guesses sent at the same time count too. A password you choose with `--password` must have at least 10 characters.
+- Web pages from other sites can't use your browser to reach HomePlay: a connection from a web page is refused unless the page was opened from HomePlay's own address (`localhost`, your Tailscale address, or a name you give with `--allow-host`).
 - Only one device plays at a time. Connecting a second one disconnects the first.
 - Sound compression talks to FFmpeg over a loopback-only socket; nothing extra is opened to your network.
+- Text that a password manager marks as sensitive is not shared through the clipboard sync.
+- Install HomePlay in your own user folder, not directly in `C:\`, and run it as administrator only when a game needs it. `homeplay_config.json` holds the password in plain text, and anyone who can change the folder can change the program.
+- Tick **Remember on this device** only on devices that are yours: it keeps the password in that browser.
 
 ## License
 
