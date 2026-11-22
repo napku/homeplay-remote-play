@@ -10,7 +10,7 @@ echo.
 echo   This adds ONE folder to Windows Defender's exclusion list, so Defender
 echo   stops scanning or quarantining HomePlay's files:
 echo.
-echo       %FOLDER%
+echo       "%FOLDER%"
 echo.
 echo   It does NOT turn your antivirus off. The rest of your PC stays protected.
 echo   Only do this for software you trust and keep in this folder.
@@ -35,8 +35,11 @@ if errorlevel 2 (
   exit /b 0
 )
 
+rem The folder goes to PowerShell in an environment variable and is never pasted into the
+rem command text, so a quote or other special character in its name cannot change the command.
+set "HP_FOLDER=%FOLDER%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "try { Add-MpPreference -ExclusionPath '%FOLDER%' -ErrorAction Stop; exit 0 } catch { exit 1 }"
+  "try { Add-MpPreference -ExclusionPath $env:HP_FOLDER -ErrorAction Stop; exit 0 } catch { exit 1 }"
 if errorlevel 1 (
   echo.
   echo   Could not change Defender settings. Usual reasons:
