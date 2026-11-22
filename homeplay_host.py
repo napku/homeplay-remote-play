@@ -2040,12 +2040,16 @@ class Session:
 # ======================================================================================
 
 class HostApp:
+    MAX_PENDING_LOGINS = 16     # connections that have not logged in yet
+    HELLO_MAX_BYTES = 16384     # the first message (the login) is small
+
     def __init__(self, args, password: str, ff: FFmpeg):
         self.args = args
         self.password = password
         self.ff = ff
         self.loop = asyncio.get_running_loop()
         self.guard = LoginGuard()
+        self.pending_logins = 0
         self.gpu_name, self.gpu_vendor, self.monitors = Windows.display_info()
         self.input = WindowsInput() if (IS_WINDOWS and not args.demo) else LoggedInput()
         self.pads = GamepadHub(not args.no_gamepad, args.demo, self.loop, self._on_rumble)
@@ -2300,24 +2304,42 @@ class HostApp:
         if self.guard.locked():
             await ws.close(CLOSE_LOCKED_OUT, "Too many wrong passwords")
             return
+        if self.pending_logins >= self.MAX_PENDING_LOGINS:
+            await ws.close(CLOSE_LOCKED_OUT, "Too many logins at once")
+            return
+        # Until the password has been checked (including the pause after a wrong guess) this
+        # connection counts as "waiting to log in", so one client cannot run a flood of guesses
+        # side by side.
+        self.pending_logins += 1
         try:
-            first = await asyncio.wait_for(ws.recv(), 20)
-            hello = json.loads(first[1]) if first and first[0] == 0x1 else None
-        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, ConnectionError,
-                OSError, WebSocketProtocolError):
-            hello = None
-        if not isinstance(hello, dict) or hello.get("t") != "hello":
-            await ws.close(CLOSE_PROTOCOL, "Expected hello")
-            return
-        password = hello.get("pw")
-        if not isinstance(password, str) or not hmac.compare_digest(
-                password.strip().encode("utf-8"), self.password.encode("utf-8")):
-            self.guard.failed()
-            log.warning("Wrong password from %s", who)
-            await asyncio.sleep(1.0)
-            await ws.close(CLOSE_BAD_PASSWORD, "Wrong password")
-            return
-        self.guard.succeeded()
+            ws.MAX_MESSAGE = self.HELLO_MAX_BYTES      # nobody is logged in yet: the first message is small
+            try:
+                first = await asyncio.wait_for(ws.recv(), 20)
+                hello = json.loads(first[1]) if first and first[0] == 0x1 else None
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, ConnectionError,
+                    OSError, WebSocketProtocolError):
+                hello = None
+            if not isinstance(hello, dict) or hello.get("t") != "hello":
+                await ws.close(CLOSE_PROTOCOL, "Expected hello")
+                return
+            # Look at the lock again: other connections may have used up the guesses while this one
+            # was waiting for its hello. Nothing awaits between this check and guard.failed(), so each
+            # guess is counted before the next one is even looked at.
+            if self.guard.locked():
+                await ws.close(CLOSE_LOCKED_OUT, "Too many wrong passwords")
+                return
+            password = hello.get("pw")
+            if not isinstance(password, str) or not hmac.compare_digest(
+                    password.strip().encode("utf-8"), self.password.encode("utf-8")):
+                self.guard.failed()
+                log.warning("Wrong password from %s", who)
+                await asyncio.sleep(1.0)
+                await ws.close(CLOSE_BAD_PASSWORD, "Wrong password")
+                return
+            self.guard.succeeded()
+            ws.MAX_MESSAGE = WebSocket.MAX_MESSAGE
+        finally:
+            self.pending_logins -= 1
         session = Session(self, ws, hello, who)
         async with self.session_lock:
             old, self.session = self.session, session
