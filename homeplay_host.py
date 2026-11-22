@@ -183,6 +183,11 @@ def describe_device(user_agent: str) -> str:
     return f"{device} ({browser})"
 
 
+def clean_for_log(text: str, limit: int = 80) -> str:
+    """Printable ASCII only, and short: header values come from the other side and end up in the log."""
+    return re.sub(r"[^\x20-\x7e]", "?", text)[:limit]
+
+
 # ======================================================================================
 # Windows: DPI, console, sleep, display info and input injection
 # ======================================================================================
@@ -2284,8 +2289,14 @@ class HostApp:
         await writer.drain()
         ws = WebSocket(reader, writer)
         peer = writer.get_extra_info("peername")
-        who = (headers.get("tailscale-user-login") or headers.get("x-forwarded-for", "").split(",")[0].strip()
-               or (peer[0] if peer else "unknown"))
+        peer_ip = str(peer[0]) if peer else "unknown"
+        claimed = ""
+        if peer_ip in ("127.0.0.1", "::1"):
+            # Only the local Tailscale proxy is believed about who is on the other end: a device that
+            # connects directly (--lan) could write anything into these headers.
+            claimed = (headers.get("tailscale-user-login")
+                       or headers.get("x-forwarded-for", "").split(",")[0].strip())
+        who = clean_for_log(claimed or peer_ip)
         if self.guard.locked():
             await ws.close(CLOSE_LOCKED_OUT, "Too many wrong passwords")
             return
