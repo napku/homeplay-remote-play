@@ -134,6 +134,7 @@ def clamp_int(value, lo: int, hi: int) -> int:
     return lo if v < lo else hi if v > hi else v
 
 
+MIN_PASSWORD_LENGTH = 10      # the shortest password --password accepts
 PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"   # no look-alikes (i/l/1, o/0)
 
 
@@ -2624,6 +2625,9 @@ async def run_host(args, password: str, ff: FFmpeg) -> None:
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.load_cert_chain(cert, key)
     bind = args.bind or ("0.0.0.0" if args.lan else "127.0.0.1")
+    if ssl_context is None and bind not in ("127.0.0.1", "localhost", "::1"):
+        log.warning("Listening on %s without HTTPS: the password and every key you press would cross the "
+                    "network unencrypted. Use --lan or --https, or keep the default (this PC only).", bind)
     try:
         server = await asyncio.start_server(app.handle_connection, bind, args.port, ssl=ssl_context,
                                             limit=65536)
@@ -2677,9 +2681,16 @@ def main(argv=None) -> None:
     config = load_config()
     if args.password:
         config["password"] = args.password.strip()
+        if len(config["password"]) < MIN_PASSWORD_LENGTH:
+            raise SystemExit(f"The password must have at least {MIN_PASSWORD_LENGTH} characters. After 6 wrong "
+                             "tries logins only pause for 2 minutes, so a short password can still be guessed.\n"
+                             "Use a longer phrase, or leave out --password to get a random one.")
     elif args.new_password or not config.get("password"):
         config["password"] = generate_password()
     save_config(config)
+    if len(str(config["password"])) < MIN_PASSWORD_LENGTH:
+        log.warning("The saved password is short and could be guessed. Run start.bat --new-password for a "
+                    "random one, or choose a longer one with --password.")
 
     ff = FFmpeg(ffmpeg_path)
     ff.inspect()
