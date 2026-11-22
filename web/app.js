@@ -524,6 +524,7 @@
 
   // ================================================================== login form
   $('pw').value = store.get('pw', '');
+  $('remember').checked = !!$('pw').value;     // new devices start unticked; devices that already remember keep doing so
   showCfg('Login');
   {
     const problem = browserProblem();
