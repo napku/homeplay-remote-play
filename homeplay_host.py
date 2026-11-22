@@ -173,6 +173,17 @@ def lan_addresses() -> list[str]:
     return sorted(ip for ip in ips if not ip.startswith(("127.", "169.254.", "0.")))
 
 
+def is_loopback_host(host: str) -> bool:
+    """Whether a bind target is explicitly local; unknown hostnames are treated as remote."""
+    normalized = host.strip().strip("[]").split("%", 1)[0].lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
 def describe_device(user_agent: str) -> str:
     ua = user_agent or ""
     device = ("iPhone" if "iPhone" in ua else "iPad" if "iPad" in ua else "Android" if "Android" in ua
@@ -1595,6 +1606,7 @@ def _unmask(data: bytes, mask: bytes) -> bytes:
 
 class WebSocket:
     MAX_MESSAGE = 1 << 20
+    MAX_FRAGMENTS = 64
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.reader = reader
@@ -1619,18 +1631,27 @@ class WebSocket:
 
     async def recv(self):
         """Next data message as (opcode, payload), or None when the browser closes."""
-        message_op, fragments = None, []
+        message_op, fragments, message_size = None, [], 0
         while True:
             b0, b1 = await self.reader.readexactly(2)
+            fin = bool(b0 & 0x80)
             opcode, n = b0 & 0x0F, b1 & 0x7F
             if b0 & 0x70 or not b1 & 0x80:
                 raise WebSocketProtocolError("unexpected frame flags")
+            if opcode not in (0x0, 0x1, 0x2, 0x8, 0x9, 0xA):
+                raise WebSocketProtocolError("unknown frame opcode")
             if n == 126:
                 n = struct.unpack("!H", await self.reader.readexactly(2))[0]
+                if n < 126:
+                    raise WebSocketProtocolError("non-minimal frame length")
             elif n == 127:
                 n = struct.unpack("!Q", await self.reader.readexactly(8))[0]
+                if n < 65536 or n & (1 << 63):
+                    raise WebSocketProtocolError("invalid frame length")
             if n > self.MAX_MESSAGE:
                 raise WebSocketProtocolError("message too large")
+            if opcode >= 0x8 and (not fin or n > 125):
+                raise WebSocketProtocolError("invalid control frame")
             mask = await self.reader.readexactly(4)
             data = _unmask(await self.reader.readexactly(n), mask) if n else b""
             if opcode == 0x8:                                         # close
@@ -1644,14 +1665,17 @@ class WebSocket:
             if opcode == 0x0:
                 if message_op is None:
                     raise WebSocketProtocolError("unexpected continuation")
-                fragments.append(data)
+                message_size += n
             else:
                 if message_op is not None:
                     raise WebSocketProtocolError("interleaved message")
-                message_op, fragments = opcode, [data]
-            if sum(len(f) for f in fragments) > self.MAX_MESSAGE:
+                message_op, fragments, message_size = opcode, [], n
+            if message_size > self.MAX_MESSAGE:
                 raise WebSocketProtocolError("message too large")
-            if b0 & 0x80:
+            if len(fragments) >= self.MAX_FRAGMENTS:
+                raise WebSocketProtocolError("too many message fragments")
+            fragments.append(data)
+            if fin:
                 return message_op, b"".join(fragments)
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
@@ -1673,7 +1697,10 @@ CONTENT_TYPES = {
     ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
     ".webmanifest": "application/manifest+json", ".json": "application/json", ".ico": "image/x-icon",
 }
-HTTP_REASONS = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed"}
+HTTP_REASONS = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed",
+                503: "Service Unavailable"}
+MAX_CONNECTIONS = 32
+MAX_LOGIN_GUARDS = 1024
 
 
 async def http_response(writer, status: int, body: bytes = b"", content_type="text/plain; charset=utf-8",
@@ -1707,7 +1734,7 @@ def parse_request(head: bytes):
 # ======================================================================================
 
 class LoginGuard:
-    """After 6 wrong passwords within 10 minutes, every login is refused for 2 minutes."""
+    """After 6 wrong passwords within 10 minutes, this client's logins pause for 2 minutes."""
 
     def __init__(self):
         self.failures = collections.deque()
@@ -1724,7 +1751,7 @@ class LoginGuard:
         if len(self.failures) >= 6:
             self.failures.clear()
             self.locked_until = now + 120
-            log.warning("Too many wrong passwords - logins are paused for 2 minutes.")
+            log.warning("Too many wrong passwords - this client's logins are paused for 2 minutes.")
 
     def succeeded(self) -> None:
         self.failures.clear()
@@ -2040,7 +2067,8 @@ class HostApp:
         self.password = password
         self.ff = ff
         self.loop = asyncio.get_running_loop()
-        self.guard = LoginGuard()
+        self.login_guards = collections.OrderedDict()
+        self.connection_count = 0
         self.gpu_name, self.gpu_vendor, self.monitors = Windows.display_info()
         self.input = WindowsInput() if (IS_WINDOWS and not args.demo) else LoggedInput()
         self.pads = GamepadHub(not args.no_gamepad, args.demo, self.loop, self._on_rumble)
@@ -2231,7 +2259,23 @@ class HostApp:
                             self.video.last_error or "unknown error")
 
     # ---- HTTP / WebSocket ------------------------------------------------------------
+    def login_guard_for(self, identity: str) -> LoginGuard:
+        guard = self.login_guards.pop(identity, None)
+        if guard is None:
+            guard = LoginGuard()
+        self.login_guards[identity] = guard
+        while len(self.login_guards) > MAX_LOGIN_GUARDS:
+            self.login_guards.popitem(last=False)
+        return guard
+
     async def handle_connection(self, reader, writer) -> None:
+        if self.connection_count >= MAX_CONNECTIONS:
+            with contextlib.suppress(Exception):
+                await http_response(writer, 503, b"Too many connections", extra={"Retry-After": "5"})
+            with contextlib.suppress(Exception):
+                writer.close()
+            return
+        self.connection_count += 1
         try:
             try:
                 head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 15)
@@ -2254,6 +2298,7 @@ class HostApp:
         except Exception:
             log.exception("Unexpected error while handling a connection")
         finally:
+            self.connection_count -= 1
             with contextlib.suppress(Exception):
                 writer.close()
 
@@ -2284,9 +2329,16 @@ class HostApp:
         await writer.drain()
         ws = WebSocket(reader, writer)
         peer = writer.get_extra_info("peername")
-        who = (headers.get("tailscale-user-login") or headers.get("x-forwarded-for", "").split(",")[0].strip()
-               or (peer[0] if peer else "unknown"))
-        if self.guard.locked():
+        peer_host = peer[0] if peer else "unknown"
+        try:
+            peer_is_loopback = ipaddress.ip_address(str(peer_host).split("%", 1)[0]).is_loopback
+        except ValueError:
+            peer_is_loopback = False
+        tailscale_user = headers.get("tailscale-user-login", "").strip() if peer_is_loopback else ""
+        who = tailscale_user or str(peer_host)
+        guard_key = f"tailscale:{tailscale_user.casefold()}" if tailscale_user else str(peer_host)
+        guard = self.login_guard_for(guard_key)
+        if guard.locked():
             await ws.close(CLOSE_LOCKED_OUT, "Too many wrong passwords")
             return
         try:
@@ -2301,12 +2353,12 @@ class HostApp:
         password = hello.get("pw")
         if not isinstance(password, str) or not hmac.compare_digest(
                 password.strip().encode("utf-8"), self.password.encode("utf-8")):
-            self.guard.failed()
+            guard.failed()
             log.warning("Wrong password from %s", who)
             await asyncio.sleep(1.0)
             await ws.close(CLOSE_BAD_PASSWORD, "Wrong password")
             return
-        self.guard.succeeded()
+        guard.succeeded()
         session = Session(self, ws, hello, who)
         async with self.session_lock:
             old, self.session = self.session, session
@@ -2462,7 +2514,8 @@ def parse_args(argv=None):
     p.add_argument("--https", action="store_true", help="serve HTTPS yourself (self-signed unless --cert/--key)")
     p.add_argument("--cert", help="certificate file (PEM) for --https")
     p.add_argument("--key", help="private key file (PEM) for --https")
-    p.add_argument("--bind", help="address to listen on (default 127.0.0.1, or 0.0.0.0 with --lan)")
+    p.add_argument("--bind", help="address to listen on (default 127.0.0.1, or 0.0.0.0 with --lan; "
+                                   "remote addresses require --lan or --https)")
     p.add_argument("--password", help="set a new password and remember it")
     p.add_argument("--new-password", action="store_true", help="make up a new random password")
     p.add_argument("--fps", type=int, default=60, help="default frame rate (the browser can change it)")
@@ -2516,13 +2569,16 @@ def print_banner(app: HostApp, urls, notes) -> None:
 
 
 async def run_host(args, password: str, ff: FFmpeg) -> None:
-    app = HostApp(args, password, ff)
     ssl_context = None
     if args.https or args.lan:
         cert, key = (args.cert, args.key) if (args.cert and args.key) else self_signed_certificate()
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.load_cert_chain(cert, key)
     bind = args.bind or ("0.0.0.0" if args.lan else "127.0.0.1")
+    if ssl_context is None and not is_loopback_host(bind):
+        raise SystemExit("Refusing to serve over unencrypted HTTP on a network address. "
+                         "Use --lan or --https for remote access.")
+    app = HostApp(args, password, ff)
     try:
         server = await asyncio.start_server(app.handle_connection, bind, args.port, ssl=ssl_context,
                                             limit=65536)

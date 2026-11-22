@@ -24,8 +24,8 @@ It automatically uses the best video codec your device can handle — **HEVC or 
 
 ## 1. Set up the gaming PC (once)
 
-1. Download the project (on GitHub: **Code → Download ZIP**) and unzip it somewhere permanent, for example `C:\HomePlay`. Before you unzip, right-click the downloaded **`.zip`**, choose **Properties**, tick **Unblock** at the bottom, then **OK**. That stops Windows putting a warning on every file inside. (If you forget, see [Windows security warnings](#windows-security-warnings) below.)
-2. Double-click **`start.bat`**. If a blue **"Windows protected your PC"** box appears, click **More info**, then **Run anyway** — this is expected for any new program that isn't from a big company, and is explained below. The first start takes a minute or two. During that first start it:
+1. Download the project (on GitHub: **Code → Download ZIP**) and unzip it somewhere permanent, for example `C:\HomePlay`. Keep Windows' downloaded-file warnings enabled and review [Windows security warnings](#windows-security-warnings) before continuing.
+2. Double-click **`start.bat`**. If SmartScreen warns you, verify that you downloaded this repository and review the program before deciding whether to continue. The first start takes a minute or two. During that first start it:
    - creates a private Python environment in the folder;
    - installs sound support;
    - installs controller support. If a **ViGEmBus** setup window opens, click through it. That driver creates the virtual Xbox controller;
@@ -111,20 +111,11 @@ What you can do on your side, most important first:
 
 ## Windows security warnings
 
-HomePlay is a small, unsigned program that captures your screen and replays keyboard and mouse input. Those are exactly the things remote-control tools do — and antivirus watches for them, because malware does them too. So Windows may show a warning the first time. Here's what each one means and what to do.
+HomePlay is an unsigned program that captures your screen and replays keyboard and mouse input. Treat security warnings carefully and verify that you downloaded HomePlay from this repository before running it.
 
-**"Windows protected your PC" (blue box, SmartScreen).** This is the one you'll almost certainly see. It is **not** a virus finding. SmartScreen simply doesn't recognise a brand-new file that isn't signed by a known company, so it asks first. Click **More info**, then **Run anyway**. To avoid it for the whole folder at once, unblock the ZIP before you extract it: right-click the `.zip`, **Properties**, tick **Unblock**, **OK**, then extract.
+**"Windows protected your PC" (SmartScreen).** This can appear for unsigned software, but it is still a reason to pause. Only continue if you trust the source and have reviewed the program.
 
-**Windows Defender flags or removes a file.** Less common, but possible. If `start.bat` says a file is missing, or Defender pops up a threat alert, it's a false positive from the behaviour above. To fix it:
-1. Open **Windows Security** → **Virus & threat protection** → **Protection history**, find the HomePlay item and choose **Allow** / **Restore**.
-2. Right-click **`allow-in-defender.bat`** → **Run as administrator**. This adds *only the HomePlay folder* to Defender's exclusion list, so it stops scanning these files. It does **not** switch your antivirus off — the rest of your PC stays protected. The script shows you exactly what it will do and how to undo it.
-3. Run `start.bat` again.
-
-**Why I'm fairly sure it's a false positive.** HomePlay is built the way that trips antivirus the *least*: it's plain, readable Python (not a packed `.exe`, which is what gets flagged most), it runs in a normal visible window, it doesn't hide, it doesn't add itself to Windows startup, it doesn't touch the registry, and it doesn't download and run unknown programs. You can read every line of `homeplay_host.py` yourself.
-
-**The only way to remove the warnings completely** is to sign the program with a code-signing certificate, which costs money each year (roughly €100+) and is meant for software companies — overkill for a personal tool. The unblock + exclusion steps above are the normal way to run your own tools.
-
-> On a **work PC**, you very likely can't change Defender or add exclusions — your IT department controls it, and trying to get around that is their call, not something HomePlay will do for you. Use your phone or your own laptop instead.
+**Windows Defender flags or removes a file.** Treat the detection as real until it has been reviewed. Do not restore the file, add the HomePlay folder to antivirus exclusions, or disable Tamper Protection just to make it run. Check the detection details, verify the download, and report a suspected false positive to Microsoft or the project maintainers. On a work PC, contact your IT department.
 
 ## Troubleshooting
 
@@ -149,6 +140,7 @@ Options (add them after `start.bat`):
 | Option | Meaning |
 |---|---|
 | `--port 8080` | Local port. |
+| `--bind address` | Bind address. Remote addresses require `--lan` or `--https`. |
 | `--fps 60`, `--bitrate 15` | Defaults, before the browser picks its own. |
 | `--monitor 0` | Which screen to stream (0 = first). |
 | `--encoder auto\|nvenc\|amf\|qsv\|x264` | Force a video encoder. |
@@ -159,13 +151,13 @@ Options (add them after `start.bat`):
 | `--https --cert file.pem --key key.pem` | Serve HTTPS with your own certificate. |
 | `--demo` | Stream a test picture and only *log* input. Good for testing. |
 
-**Port forwarding instead of Tailscale.** Not recommended. If you really want it, use `--lan`, forward that one TCP port on your router, and use a long password. Preferably also get a real certificate for your own domain (`--cert`/`--key`). Anyone who guesses the password controls your PC. After 6 wrong passwords, logins pause for 2 minutes.
+**Port forwarding instead of Tailscale.** Not recommended. If you really want it, use `--lan`, forward that one TCP port on your router, and use a long password. Preferably also get a real certificate for your own domain (`--cert`/`--key`). Anyone who guesses the password controls your PC. Six wrong passwords from one client within 10 minutes pause that client's attempts for 2 minutes.
 
 **Start with Windows.** Press Win+R, type `shell:startup`, and put a shortcut to `start.bat` in that folder.
 
 **Stop sharing over Tailscale.** Run `tailscale serve reset`.
 
-**Files.** `homeplay_config.json` holds your password. `certs\` is only used with `--lan`. `allow-in-defender.bat` is the optional antivirus helper (see [Windows security warnings](#windows-security-warnings)). Everything else is the program. To uninstall, delete the folder and run `tailscale serve reset`; if you ran the Defender helper, also run `powershell Remove-MpPreference -ExclusionPath "C:\HomePlay"` as administrator.
+**Files.** `homeplay_config.json` holds your password. `certs\` is only used with `--lan`. Everything else is the program. To uninstall, delete the folder and run `tailscale serve reset`.
 
 ## How it compares
 
@@ -178,7 +170,8 @@ HomePlay's strength is that the phone or work PC needs **only a browser**. If yo
 ## Security
 
 - Without `--lan`, HomePlay only listens on the PC itself (`127.0.0.1`). Only devices signed in to *your* Tailscale account can reach it, through Tailscale's encrypted link.
-- A random password protects every connection. Six wrong tries pause logins for 2 minutes.
+- HomePlay refuses unencrypted HTTP on non-loopback bind addresses; use `--lan` or `--https` for remote access.
+- A random password protects every connection. Six wrong tries from one client within 10 minutes pause that client's logins for 2 minutes.
 - Only one device plays at a time. Connecting a second one disconnects the first.
 - Sound compression talks to FFmpeg over a loopback-only socket; nothing extra is opened to your network.
 

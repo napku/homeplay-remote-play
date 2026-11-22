@@ -10,11 +10,10 @@ echo.
 rem ------------------------------------------------------------------ was a file removed by antivirus?
 if not exist "%~dp0homeplay_host.py" (
   echo   The main program file "homeplay_host.py" is missing.
-  echo   Windows Defender may have quarantined it. To get it back:
-  echo     1. Open Windows Security ^> Virus ^& threat protection ^> Protection history
-  echo        and allow / restore the HomePlay item.
-  echo     2. Right-click "allow-in-defender.bat" ^> Run as administrator.
-  echo     3. Run start.bat again.
+  echo   Check Windows Security ^> Virus ^& threat protection ^> Protection history
+  echo   to see whether it was quarantined. Do not restore it or exclude this folder
+  echo   until you have verified the download and reviewed the detection.
+  echo   Get a clean copy from the official HomePlay repository if needed.
   echo.
   pause
   exit /b 1
