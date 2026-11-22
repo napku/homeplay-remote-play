@@ -524,6 +524,7 @@
 
   // ================================================================== login form
   $('pw').value = store.get('pw', '');
+  $('remember').checked = !!$('pw').value;
   showCfg('Login');
   {
     const problem = browserProblem();

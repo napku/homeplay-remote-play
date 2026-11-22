@@ -135,6 +135,7 @@ def clamp_int(value, lo: int, hi: int) -> int:
 
 
 PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"   # no look-alikes (i/l/1, o/0)
+MIN_PASSWORD_LENGTH = 10
 
 
 def generate_password() -> str:
@@ -192,6 +193,11 @@ def describe_device(user_agent: str) -> str:
     browser = ("Edge" if "Edg/" in ua else "Firefox" if "Firefox/" in ua else "Chrome" if "Chrome/" in ua
                else "Safari" if "Safari/" in ua else "browser")
     return f"{device} ({browser})"
+
+
+def clean_for_log(text: str, limit: int = 80) -> str:
+    """Keep untrusted header values short and printable before writing them to logs."""
+    return re.sub(r"[^\x20-\x7e]", "?", text)[:limit]
 
 
 # ======================================================================================
@@ -366,6 +372,8 @@ class Windows:
         try:
             if not u.IsClipboardFormatAvailable(13):           # CF_UNICODETEXT
                 return None
+            if Windows._clipboard_is_sensitive(u):
+                return None
             handle = u.GetClipboardData(13)
             if not handle:
                 return None
@@ -378,6 +386,17 @@ class Windows:
                 k.GlobalUnlock(handle)
         finally:
             u.CloseClipboard()
+
+    @staticmethod
+    def _clipboard_is_sensitive(u) -> bool:
+        """Honor password managers' Windows clipboard marker when reading PC clipboard text."""
+        try:
+            u.RegisterClipboardFormatW.argtypes = (wintypes.LPCWSTR,)
+            u.RegisterClipboardFormatW.restype = ctypes.c_uint
+            fmt = u.RegisterClipboardFormatW("ExcludeClipboardContentFromMonitorProcessing")
+            return bool(fmt and u.IsClipboardFormatAvailable(fmt))
+        except Exception:
+            return False
 
     @staticmethod
     def set_clipboard_text(text: str) -> bool:
@@ -1697,8 +1716,8 @@ CONTENT_TYPES = {
     ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
     ".webmanifest": "application/manifest+json", ".json": "application/json", ".ico": "image/x-icon",
 }
-HTTP_REASONS = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed",
-                503: "Service Unavailable"}
+HTTP_REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found",
+                405: "Method Not Allowed", 503: "Service Unavailable"}
 MAX_CONNECTIONS = 32
 MAX_LOGIN_GUARDS = 1024
 
@@ -1727,6 +1746,19 @@ def parse_request(head: bytes):
             headers[name.strip().lower()] = value.strip()
     path = urllib.parse.urlsplit(parts[1]).path or "/"
     return parts[0].upper(), path, headers
+
+
+def host_port(value: str, default_port: int):
+    """Parse an HTTP host value into a normalized hostname and port."""
+    try:
+        parts = urllib.parse.urlsplit("//" + value.strip().lower())
+        name, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if (not name or parts.username is not None or parts.path or parts.query or parts.fragment
+            or port == 0):
+        return None
+    return name, default_port if port is None else port
 
 
 # ======================================================================================
@@ -2062,6 +2094,9 @@ class Session:
 # ======================================================================================
 
 class HostApp:
+    MAX_PENDING_LOGINS = 16
+    HELLO_MAX_BYTES = 16384
+
     def __init__(self, args, password: str, ff: FFmpeg):
         self.args = args
         self.password = password
@@ -2069,6 +2104,11 @@ class HostApp:
         self.loop = asyncio.get_running_loop()
         self.login_guards = collections.OrderedDict()
         self.connection_count = 0
+        self.pending_logins = 0
+        self.extra_hosts = {str(h).strip().lower() for h in (getattr(args, "allow_host", None) or [])
+                            if str(h).strip()}
+        bind = (getattr(args, "bind", None) or "127.0.0.1").lower()
+        self.own_names = {"localhost", socket.gethostname().lower(), bind}
         self.gpu_name, self.gpu_vendor, self.monitors = Windows.display_info()
         self.input = WindowsInput() if (IS_WINDOWS and not args.demo) else LoggedInput()
         self.pads = GamepadHub(not args.no_gamepad, args.demo, self.loop, self._on_rumble)
@@ -2317,11 +2357,49 @@ class HostApp:
         await http_response(writer, 200, body if method == "GET" else b"", content_type,
                             length=len(body), extra={"Cache-Control": "no-cache"})
 
+    def host_allowed(self, name: str) -> bool:
+        """Only trust this host's names, explicit aliases, localhost names, or literal IPs."""
+        if name in self.own_names or name in self.extra_hosts:
+            return True
+        try:
+            ipaddress.ip_address(name)
+            return True
+        except ValueError:
+            return False
+
+    def origin_problem(self, headers: dict) -> str | None:
+        """Reject browser WebSocket requests unless their Origin matches an allowed HomePlay host."""
+        origin = headers.get("origin")
+        if origin is None:                 # Native clients do not send Origin; they use the password.
+            return None
+        try:
+            parsed = urllib.parse.urlsplit(origin.strip().lower())
+            name, port = parsed.hostname, parsed.port
+        except ValueError:
+            return "malformed Origin header"
+        if (parsed.scheme not in ("http", "https") or not name or parsed.username is not None
+                or parsed.path or parsed.query or parsed.fragment):
+            return f"invalid Origin {clean_for_log(origin, 40)!r}"
+        default_port = 443 if parsed.scheme == "https" else 80
+        wanted = (name, default_port if port is None else port)
+        claims = (headers.get("host", ""), headers.get("x-forwarded-host", "").split(",")[0])
+        if not any(host_port(claim, default_port) == wanted for claim in claims):
+            return f"page from {clean_for_log(origin, 40)!r}"
+        if not self.host_allowed(name):
+            return f"unrecognized host {clean_for_log(name, 40)!r}"
+        return None
+
     async def handle_websocket(self, reader, writer, headers: dict) -> None:
         key = headers.get("sec-websocket-key", "")
         if headers.get("upgrade", "").lower() != "websocket" or not key \
                 or headers.get("sec-websocket-version") != "13":
             await http_response(writer, 400, b"Expected a WebSocket request")
+            return
+        problem = self.origin_problem(headers)
+        if problem:
+            log.warning("Refused a cross-origin WebSocket connection (%s). Configure --allow-host if needed.",
+                        problem)
+            await http_response(writer, 403, b"Forbidden: this web page may not connect to HomePlay")
             return
         accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
         writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -2334,31 +2412,49 @@ class HostApp:
             peer_is_loopback = ipaddress.ip_address(str(peer_host).split("%", 1)[0]).is_loopback
         except ValueError:
             peer_is_loopback = False
-        tailscale_user = headers.get("tailscale-user-login", "").strip() if peer_is_loopback else ""
-        who = tailscale_user or str(peer_host)
-        guard_key = f"tailscale:{tailscale_user.casefold()}" if tailscale_user else str(peer_host)
+        claimed = ""
+        if peer_is_loopback:
+            claimed = headers.get("tailscale-user-login", "").strip()
+            if not claimed:
+                claimed = headers.get("x-forwarded-for", "").split(",")[0].strip()
+        identity = clean_for_log(claimed or str(peer_host), 200)
+        who = clean_for_log(identity)
+        guard_key = f"tailscale:{identity.casefold()}" if claimed else str(peer_host)
         guard = self.login_guard_for(guard_key)
         if guard.locked():
             await ws.close(CLOSE_LOCKED_OUT, "Too many wrong passwords")
             return
+        if self.pending_logins >= self.MAX_PENDING_LOGINS:
+            await ws.close(CLOSE_LOCKED_OUT, "Too many logins at once")
+            return
+        self.pending_logins += 1
         try:
-            first = await asyncio.wait_for(ws.recv(), 20)
-            hello = json.loads(first[1]) if first and first[0] == 0x1 else None
-        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, ConnectionError,
-                OSError, WebSocketProtocolError):
-            hello = None
-        if not isinstance(hello, dict) or hello.get("t") != "hello":
-            await ws.close(CLOSE_PROTOCOL, "Expected hello")
-            return
-        password = hello.get("pw")
-        if not isinstance(password, str) or not hmac.compare_digest(
-                password.strip().encode("utf-8"), self.password.encode("utf-8")):
-            guard.failed()
-            log.warning("Wrong password from %s", who)
-            await asyncio.sleep(1.0)
-            await ws.close(CLOSE_BAD_PASSWORD, "Wrong password")
-            return
-        guard.succeeded()
+            ws.MAX_MESSAGE = self.HELLO_MAX_BYTES
+            try:
+                first = await asyncio.wait_for(ws.recv(), 20)
+                hello = json.loads(first[1]) if first and first[0] == 0x1 else None
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, ConnectionError,
+                    OSError, WebSocketProtocolError):
+                hello = None
+            if not isinstance(hello, dict) or hello.get("t") != "hello":
+                await ws.close(CLOSE_PROTOCOL, "Expected hello")
+                return
+            # Re-check after reading hello so simultaneous attempts cannot pass the guard together.
+            if guard.locked():
+                await ws.close(CLOSE_LOCKED_OUT, "Too many wrong passwords")
+                return
+            password = hello.get("pw")
+            if not isinstance(password, str) or not hmac.compare_digest(
+                    password.strip().encode("utf-8"), self.password.encode("utf-8")):
+                guard.failed()
+                log.warning("Wrong password from %s", who)
+                await asyncio.sleep(1.0)
+                await ws.close(CLOSE_BAD_PASSWORD, "Wrong password")
+                return
+            guard.succeeded()
+            ws.MAX_MESSAGE = WebSocket.MAX_MESSAGE
+        finally:
+            self.pending_logins -= 1
         session = Session(self, ws, hello, who)
         async with self.session_lock:
             old, self.session = self.session, session
@@ -2516,6 +2612,8 @@ def parse_args(argv=None):
     p.add_argument("--key", help="private key file (PEM) for --https")
     p.add_argument("--bind", help="address to listen on (default 127.0.0.1, or 0.0.0.0 with --lan; "
                                    "remote addresses require --lan or --https)")
+    p.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                   help="also trust this exact host name in browser Origin checks (repeat as needed)")
     p.add_argument("--password", help="set a new password and remember it")
     p.add_argument("--new-password", action="store_true", help="make up a new random password")
     p.add_argument("--fps", type=int, default=60, help="default frame rate (the browser can change it)")
@@ -2596,6 +2694,9 @@ async def run_host(args, password: str, ff: FFmpeg) -> None:
         ts_url, advice = await asyncio.to_thread(Tailscale.setup, args.port, args.tailscale)
         if ts_url:
             urls.append(("Anywhere:", f"{ts_url}   (via Tailscale)"))
+            ts_host = urllib.parse.urlsplit(ts_url).hostname
+            if ts_host:
+                app.extra_hosts.add(ts_host.lower())
         if advice:
             notes.append(advice)
     Windows.keep_awake(display=False)          # the PC must stay awake so you can connect
@@ -2628,9 +2729,15 @@ def main(argv=None) -> None:
 
     config = load_config()
     if args.password:
-        config["password"] = args.password.strip()
-    elif args.new_password or not config.get("password"):
+        chosen_password = args.password.strip()
+        if len(chosen_password) < MIN_PASSWORD_LENGTH:
+            raise SystemExit(f"A chosen password must be at least {MIN_PASSWORD_LENGTH} characters.")
+        config["password"] = chosen_password
+    elif args.new_password or not isinstance(config.get("password"), str) or not config["password"].strip():
         config["password"] = generate_password()
+    if len(config["password"].strip()) < MIN_PASSWORD_LENGTH:
+        log.warning("The saved password is shorter than %d characters; change it with --password.",
+                    MIN_PASSWORD_LENGTH)
     save_config(config)
 
     ff = FFmpeg(ffmpeg_path)

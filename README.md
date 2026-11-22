@@ -24,8 +24,8 @@ It automatically uses the best video codec your device can handle — **HEVC or 
 
 ## 1. Set up the gaming PC (once)
 
-1. Download the project (on GitHub: **Code → Download ZIP**) and unzip it somewhere permanent, for example `C:\HomePlay`. Keep Windows' downloaded-file warnings enabled and review [Windows security warnings](#windows-security-warnings) before continuing.
-2. Double-click **`start.bat`**. If SmartScreen warns you, verify that you downloaded this repository and review the program before deciding whether to continue. The first start takes a minute or two. During that first start it:
+1. Download the project (on GitHub: **Code → Download ZIP**) and unzip it somewhere permanent **inside your own user folder**, for example `C:\Users\<your name>\HomePlay`. Other user accounts can usually change files directly under `C:\`, and HomePlay stores the password that controls your PC.
+2. Double-click **`start.bat`**. If SmartScreen warns you, keep the warning enabled and review the source and detection details before deciding whether to continue. The first start takes a minute or two. During that first start it:
    - creates a private Python environment in the folder;
    - installs sound support;
    - installs controller support. If a **ViGEmBus** setup window opens, click through it. That driver creates the virtual Xbox controller;
@@ -87,7 +87,7 @@ HomePlay doesn't open your PC to the internet. Instead, **Tailscale** creates a 
 
 Away from home, your **home upload speed** limits the bitrate. Run a speed test at home and pick about 70 % of your upload as the Auto maximum. Turn on **Stats** in the menu to watch the frame rate, codec and dropped frames.
 
-**Clipboard.** When the PC and browser are connected, the menu has **Clipboard** buttons: copy text on your phone and "Send clipboard to PC", or copy on the PC and it's offered to the device. Handy for pasting a password, a URL or a game code.
+**Clipboard.** When the PC and browser are connected, the menu has **Clipboard** buttons: copy text on your phone and "Send clipboard to PC", or copy on the PC and it's offered to the device. Password managers that mark clipboard text as sensitive are excluded from PC-to-device sharing.
 
 **Sound** is compressed with Opus by default: about 0.15 instead of 1.5 Mbit/s, which leaves more of your connection for the picture. On a fast home network you can tick **Uncompressed sound** in the menu to save another ~10 ms of sound delay.
 
@@ -123,7 +123,7 @@ HomePlay is an unsigned program that captures your screen and replays keyboard a
 |---|---|
 | "Can't reach the PC" | Is `start.bat` running? Is Tailscale switched on, on **both** devices? Is the PC asleep? HomePlay keeps the PC awake while it runs, but it can't wake a PC that's already asleep. Turn off sleep in Windows power settings. |
 | "Couldn't start the screen capture" | The PC is locked (Win+L) or a UAC prompt is showing. Windows doesn't let other programs see those screens. Sign in on the PC. To avoid this, let the screen turn off but don't lock the PC: Settings, Accounts, Sign-in options, "If you've been away…", set to **Never**. |
-| A game ignores keyboard/mouse/controller | The game runs as administrator. Right-click `start.bat` and choose **Run as administrator**. |
+| A game ignores keyboard/mouse/controller | The game runs as administrator. Right-click `start.bat` and choose **Run as administrator**. Only do this if the HomePlay folder is in your own user folder. |
 | No sound | Check the **Sound:** line in the HomePlay window. HomePlay records the PC's *default* playback device. |
 | Controller does nothing | Check the **Gamepad:** line. Install the ViGEmBus driver ([releases page](https://github.com/nefarius/ViGEmBus/releases)), then restart HomePlay. |
 | "This page has to be opened with https://" | Use the Tailscale address `https://….ts.net`, or `http://localhost:8080` on the PC itself. A plain `http://192.168…` address won't work. |
@@ -149,6 +149,7 @@ Options (add them after `start.bat`):
 | `--no-audio`, `--no-gamepad`, `--no-clipboard` | Turn those parts off. |
 | `--lan` | Also accept devices on your home network directly. This uses HTTPS with a self-signed certificate: the browser shows a warning, and iPhones may refuse it. It needs `pip install cryptography`. |
 | `--https --cert file.pem --key key.pem` | Serve HTTPS with your own certificate. |
+| `--allow-host NAME` | Trust this exact host name in browser Origin checks; repeat for additional names. Usually only needed for a custom domain or reverse proxy. |
 | `--demo` | Stream a test picture and only *log* input. Good for testing. |
 
 **Port forwarding instead of Tailscale.** Not recommended. If you really want it, use `--lan`, forward that one TCP port on your router, and use a long password. Preferably also get a real certificate for your own domain (`--cert`/`--key`). Anyone who guesses the password controls your PC. Six wrong passwords from one client within 10 minutes pause that client's attempts for 2 minutes.
@@ -171,9 +172,12 @@ HomePlay's strength is that the phone or work PC needs **only a browser**. If yo
 
 - Without `--lan`, HomePlay only listens on the PC itself (`127.0.0.1`). Only devices signed in to *your* Tailscale account can reach it, through Tailscale's encrypted link.
 - HomePlay refuses unencrypted HTTP on non-loopback bind addresses; use `--lan` or `--https` for remote access.
-- A random password protects every connection. Six wrong tries from one client within 10 minutes pause that client's logins for 2 minutes.
+- A random password protects every connection. Six wrong tries from one client within 10 minutes pause that client's logins for 2 minutes, including simultaneous guesses. Chosen passwords must be at least 10 characters.
+- Browser pages from other sites cannot open a HomePlay WebSocket; the Origin must match a recognized HomePlay address. Use `--allow-host` for a custom domain.
 - Only one device plays at a time. Connecting a second one disconnects the first.
 - Sound compression talks to FFmpeg over a loopback-only socket; nothing extra is opened to your network.
+- Password managers' clipboard entries marked sensitive are not forwarded from the PC.
+- The password is stored in plain text in `homeplay_config.json`; keep the folder in your user profile and remember passwords only on devices you control.
 
 ## License
 
