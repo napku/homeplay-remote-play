@@ -149,7 +149,7 @@ Options (add them after `start.bat`):
 | `--no-audio`, `--no-gamepad`, `--no-clipboard` | Turn those parts off. |
 | `--lan` | Also accept devices on your home network directly. This uses HTTPS with a self-signed certificate: the browser shows a warning, and iPhones may refuse it. It needs `pip install cryptography`. |
 | `--https --cert file.pem --key key.pem` | Serve HTTPS with your own certificate. |
-| `--allow-host NAME` | Trust this exact host name in browser Origin checks; repeat for additional names. Usually only needed for a custom domain or reverse proxy. |
+| `--allow-host NAME` | Trust this exact host name in browser Origin checks; repeat for additional names. For a reverse proxy, preserve `Host` and set `X-Forwarded-Proto`. |
 | `--demo` | Stream a test picture and only *log* input. Good for testing. |
 
 **Port forwarding instead of Tailscale.** Not recommended. If you really want it, use `--lan`, forward that one TCP port on your router, and use a long password. Preferably also get a real certificate for your own domain (`--cert`/`--key`). Anyone who guesses the password controls your PC. Six wrong passwords from one client within 10 minutes pause that client's attempts for 2 minutes.
@@ -173,7 +173,7 @@ HomePlay's strength is that the phone or work PC needs **only a browser**. If yo
 - Without `--lan`, HomePlay only listens on the PC itself (`127.0.0.1`). Only devices signed in to *your* Tailscale account can reach it, through Tailscale's encrypted link.
 - HomePlay refuses unencrypted HTTP on non-loopback bind addresses; use `--lan` or `--https` for remote access.
 - A random password protects every connection. Six wrong tries from one client within 10 minutes pause that client's logins for 2 minutes, including simultaneous guesses. Chosen passwords must be at least 10 characters.
-- Browser pages from other sites cannot open a HomePlay WebSocket; the Origin must match a recognized HomePlay address. Use `--allow-host` for a custom domain.
+- Browser pages from other sites cannot open a HomePlay WebSocket; the Origin scheme, host, and port must match a recognized HomePlay address. Use `--allow-host` for a custom domain.
 - Only one device plays at a time. Connecting a second one disconnects the first.
 - Sound compression talks to FFmpeg over a loopback-only socket; nothing extra is opened to your network.
 - Password managers' clipboard entries marked sensitive are not forwarded from the PC.

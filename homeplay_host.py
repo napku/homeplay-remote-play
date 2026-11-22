@@ -1841,7 +1841,7 @@ class Session:
         self.settings = StreamSettings.from_client(hello.get("cfg") or {}, app.default_settings)
         self.alive = True
         self.finished = asyncio.Event()
-        self.out: asyncio.Queue = asyncio.Queue()
+        self.out: asyncio.Queue = asyncio.Queue(maxsize=64)
         self.inflight: collections.OrderedDict[int, float] = collections.OrderedDict()
         self.seq = 0
         self.waiting_for_keyframe = True
@@ -1868,13 +1868,27 @@ class Session:
         self.opus_seq = 0
 
     # ---- outgoing -------------------------------------------------------------------
-    def send_json(self, obj) -> None:
-        if self.alive:
+    def send_json(self, obj) -> bool:
+        if not self.alive:
+            return False
+        try:
             self.out.put_nowait((0x1, [json.dumps(obj, separators=(",", ":")).encode("utf-8")]))
+            return True
+        except asyncio.QueueFull:
+            self.alive = False
+            self.ws.abort()
+            return False
 
-    def send_binary(self, *parts) -> None:
-        if self.alive:
+    def send_binary(self, *parts) -> bool:
+        if not self.alive:
+            return False
+        try:
             self.out.put_nowait((0x2, parts))
+            return True
+        except asyncio.QueueFull:
+            self.alive = False
+            self.ws.abort()
+            return False
 
     async def _sender(self) -> None:
         try:
@@ -1930,7 +1944,10 @@ class Session:
         if len(self.inflight) > 600:
             self.inflight.popitem(last=False)
         header = struct.pack("<BBII", MSG_VIDEO_FRAME, 1 if key else 0, self.seq & 0xFFFFFFFF, ts & 0xFFFFFFFF)
-        self.send_binary(header, payload)
+        if not self.send_binary(header, payload):
+            self.inflight.pop(self.seq, None)
+            self.dropped += 1
+            self.waiting_for_keyframe = True
 
     def on_ack(self, seq: int) -> None:
         now, sent_at = time.monotonic(), None
@@ -1982,13 +1999,20 @@ class Session:
                 if isinstance(m[1], str):
                     inp.text(m[1][:500])
             elif t == "g":
-                pad_id = str(m[1])[:16]
+                if not isinstance(m[1], str) or len(m[1]) > 16:
+                    return
+                pad_id = m[1]
+                if not re.fullmatch(r"(?:touch|p[0-9]{1,3})", pad_id):
+                    return
+                if pad_id not in self.pad_ids and len(self.pad_ids) >= GamepadHub.MAX_PADS:
+                    return
                 self.pad_ids.add(pad_id)
                 self.app.pads.update(pad_id, clamp_int(m[2], 0, 0xFFFF), clamp_int(m[3], 0, 255),
                                      clamp_int(m[4], 0, 255), *(clamp_int(v, -32768, 32767) for v in m[5:9]))
             elif t == "gx":
-                self.pad_ids.discard(str(m[1])[:16])
-                self.app.pads.remove(str(m[1])[:16])
+                if isinstance(m[1], str) and re.fullmatch(r"(?:touch|p[0-9]{1,3})", m[1]):
+                    self.pad_ids.discard(m[1])
+                    self.app.pads.remove(m[1])
             elif t == "ack":
                 self.on_ack(int(m[1]))
             elif t == "ping":
@@ -2073,7 +2097,8 @@ class Session:
         finally:
             self.alive = False
             stats.cancel()
-            self.out.put_nowait(None)
+            with contextlib.suppress(asyncio.QueueFull):
+                self.out.put_nowait(None)
             self.app.input.release_all()
             for pad_id in self.pad_ids:
                 self.app.pads.remove(pad_id)
@@ -2107,6 +2132,7 @@ class HostApp:
         self.pending_logins = 0
         self.extra_hosts = {str(h).strip().lower() for h in (getattr(args, "allow_host", None) or [])
                             if str(h).strip()}
+        self.tailscale_hosts: set[str] = set()
         bind = (getattr(args, "bind", None) or "127.0.0.1").lower()
         self.own_names = {"localhost", socket.gethostname().lower(), bind}
         self.gpu_name, self.gpu_vendor, self.monitors = Windows.display_info()
@@ -2126,8 +2152,10 @@ class HostApp:
         self.session: Session | None = None
         self.session_lock = asyncio.Lock()
         self._clip_last = ""
+        self._clip_write_queue: queue.Queue = queue.Queue(maxsize=1)
         self._stopping = False
         if IS_WINDOWS and not args.demo and not args.no_clipboard:
+            threading.Thread(target=self._clipboard_writer, name="clipboard-write", daemon=True).start()
             threading.Thread(target=self._clipboard_watch, name="clipboard", daemon=True).start()
 
     # ---- callbacks from video / audio / gamepads ------------------------------------
@@ -2208,8 +2236,28 @@ class HostApp:
         if not IS_WINDOWS or self.args.no_clipboard or self.args.demo:
             return
         self._clip_last = text
-        threading.Thread(target=lambda: Windows.set_clipboard_text(text) and None,
-                         daemon=True).start()
+        try:
+            self._clip_write_queue.put_nowait(text)
+        except queue.Full:
+            # Coalesce pending writes so a chatty client cannot build an unbounded backlog.
+            with contextlib.suppress(queue.Empty):
+                self._clip_write_queue.get_nowait()
+            with contextlib.suppress(queue.Full):
+                self._clip_write_queue.put_nowait(text)
+
+    def _clipboard_writer(self) -> None:
+        """Serialize clipboard writes on one bounded worker instead of spawning per-message threads."""
+        while not self._stopping:
+            try:
+                text = self._clip_write_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if text is None:
+                return
+            try:
+                Windows.set_clipboard_text(text)
+            except Exception:
+                log.debug("Could not write the clipboard", exc_info=True)
 
     def _clipboard_watch(self) -> None:
         """Watch the PC's clipboard and push changes to the browser (PC -> browser)."""
@@ -2367,7 +2415,7 @@ class HostApp:
         except ValueError:
             return False
 
-    def origin_problem(self, headers: dict) -> str | None:
+    def origin_problem(self, headers: dict, secure_transport: bool, peer_is_loopback: bool) -> str | None:
         """Reject browser WebSocket requests unless their Origin matches an allowed HomePlay host."""
         origin = headers.get("origin")
         if origin is None:                 # Native clients do not send Origin; they use the password.
@@ -2387,6 +2435,15 @@ class HostApp:
             return f"page from {clean_for_log(origin, 40)!r}"
         if not self.host_allowed(name):
             return f"unrecognized host {clean_for_log(name, 40)!r}"
+        expected_scheme = "https" if secure_transport or name in self.tailscale_hosts else "http"
+        if not secure_transport and peer_is_loopback and name not in self.tailscale_hosts:
+            forwarded_scheme = headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+            if forwarded_scheme in ("http", "https"):
+                expected_scheme = forwarded_scheme
+            elif name in self.extra_hosts:
+                expected_scheme = "https"
+        if parsed.scheme != expected_scheme:
+            return f"scheme mismatch for {clean_for_log(name, 40)!r}"
         return None
 
     async def handle_websocket(self, reader, writer, headers: dict) -> None:
@@ -2395,7 +2452,14 @@ class HostApp:
                 or headers.get("sec-websocket-version") != "13":
             await http_response(writer, 400, b"Expected a WebSocket request")
             return
-        problem = self.origin_problem(headers)
+        peer = writer.get_extra_info("peername")
+        peer_host = peer[0] if peer else "unknown"
+        try:
+            peer_is_loopback = ipaddress.ip_address(str(peer_host).split("%", 1)[0]).is_loopback
+        except ValueError:
+            peer_is_loopback = False
+        problem = self.origin_problem(headers, writer.get_extra_info("ssl_object") is not None,
+                                      peer_is_loopback)
         if problem:
             log.warning("Refused a cross-origin WebSocket connection (%s). Configure --allow-host if needed.",
                         problem)
@@ -2406,12 +2470,6 @@ class HostApp:
                       f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
         await writer.drain()
         ws = WebSocket(reader, writer)
-        peer = writer.get_extra_info("peername")
-        peer_host = peer[0] if peer else "unknown"
-        try:
-            peer_is_loopback = ipaddress.ip_address(str(peer_host).split("%", 1)[0]).is_loopback
-        except ValueError:
-            peer_is_loopback = False
         claimed = ""
         if peer_is_loopback:
             claimed = headers.get("tailscale-user-login", "").strip()
@@ -2613,7 +2671,8 @@ def parse_args(argv=None):
     p.add_argument("--bind", help="address to listen on (default 127.0.0.1, or 0.0.0.0 with --lan; "
                                    "remote addresses require --lan or --https)")
     p.add_argument("--allow-host", action="append", default=[], metavar="NAME",
-                   help="also trust this exact host name in browser Origin checks (repeat as needed)")
+                   help="also trust this exact host name in browser Origin checks; reverse proxies must "
+                        "preserve Host and set X-Forwarded-Proto (repeat as needed)")
     p.add_argument("--password", help="set a new password and remember it")
     p.add_argument("--new-password", action="store_true", help="make up a new random password")
     p.add_argument("--fps", type=int, default=60, help="default frame rate (the browser can change it)")
@@ -2697,6 +2756,7 @@ async def run_host(args, password: str, ff: FFmpeg) -> None:
             ts_host = urllib.parse.urlsplit(ts_url).hostname
             if ts_host:
                 app.extra_hosts.add(ts_host.lower())
+                app.tailscale_hosts.add(ts_host.lower())
         if advice:
             notes.append(advice)
     Windows.keep_awake(display=False)          # the PC must stay awake so you can connect
